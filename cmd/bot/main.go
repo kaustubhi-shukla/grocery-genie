@@ -9,6 +9,7 @@
 package main
 
 import (
+	"io"
 	"log"
 	"os"
 
@@ -19,6 +20,16 @@ import (
 )
 
 func main() {
+	// Mirror log output to both stdout and bot.log so we can tail it
+	// from another terminal. The log package itself does not buffer —
+	// each log.Printf call writes immediately to all writers below.
+	logFile, err := os.OpenFile("bot.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("opening log file: %v", err)
+	}
+	defer logFile.Close()
+	log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+
 	// Load environment variables from .env into the process environment.
 	if err := godotenv.Load(); err != nil {
 		log.Println("note: no .env file found, relying on real environment")

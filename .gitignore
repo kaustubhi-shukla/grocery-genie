@@ -25,6 +25,7 @@ bin/
 # Logs
 *.log
 logs/
+bot.log
 
 # Receipt images uploaded for testing
 evals/receipt_samples/personal/
