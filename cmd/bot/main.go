@@ -9,14 +9,18 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 
+	"github.com/kaustubhi-shukla/grocery-genie/internal/agents"
 	"github.com/kaustubhi-shukla/grocery-genie/internal/database"
 	"github.com/kaustubhi-shukla/grocery-genie/internal/telegram"
+	"github.com/kaustubhi-shukla/grocery-genie/internal/tools"
 )
 
 func main() {
@@ -46,16 +50,35 @@ func main() {
 		log.Fatal("GEMINI_API_KEY is not set (check your .env file)")
 	}
 
-	// Open the database. We will start using it in step 7 when we log
-	// the first real purchases.
+	// Open the database. We will start using it in step 8 when we log
+	// confirmed purchases into the inventory.
 	db, err := database.Open("grocery.db")
 	if err != nil {
 		log.Fatalf("opening database: %v", err)
 	}
 	defer db.Close()
 
-	// Build the bot.
-	bot, err := telegram.New(token)
+	// Build the Receipt Agent — wraps Gemini Vision. ctx is the root
+	// context for the SDK; individual scans wrap their own timeouts.
+	ctx := context.Background()
+	receiptAgent, err := agents.NewReceiptAgent(ctx, os.Getenv("GEMINI_API_KEY"))
+	if err != nil {
+		log.Fatalf("creating receipt agent: %v", err)
+	}
+	defer receiptAgent.Close()
+
+	// Inventory toolset — turns DB writes into discrete operations
+	// the bot can call (SaveConfirmedOrder, future stock queries).
+	inventory := tools.NewInventory(db)
+
+	// Session store keeps in-progress orders in memory between the
+	// initial scan and the final payment confirmation. 10-min TTL —
+	// if user goes silent that long, the order is dropped.
+	sessions := telegram.NewSessionStore(10 * time.Minute)
+	defer sessions.Close()
+
+	// Build the bot, passing everything its handlers need.
+	bot, err := telegram.New(token, receiptAgent, inventory, sessions)
 	if err != nil {
 		log.Fatalf("creating telegram bot: %v", err)
 	}

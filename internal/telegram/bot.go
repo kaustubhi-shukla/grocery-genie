@@ -1,40 +1,57 @@
 // Package telegram is the thin wrapper around the Telegram Bot API.
 //
-// All Telegram-specific code lives here. The rest of the app talks to
-// Bot via methods like Start() and (later) handlers we will plug in.
-// If we ever swap Telegram for WhatsApp, only this package changes.
-//
-// Current state (Phase 1, step 6): bot connects to Telegram, responds
-// to /start, echoes any text message, and acknowledges photos. The
-// actual receipt scanning and meal parsing arrive in steps 7+.
+// All Telegram-specific code lives here. The rest of the app talks
+// to Bot via its public methods (Start, Stop). Handler logic uses
+// SessionStore to remember in-progress orders across messages, and
+// calls into the agents/tools packages for AI and persistence.
 package telegram
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"strings"
 	"time"
 
 	tele "gopkg.in/telebot.v3"
+
+	"github.com/kaustubhi-shukla/grocery-genie/internal/agents"
+	"github.com/kaustubhi-shukla/grocery-genie/internal/tools"
 )
 
-// Bot is our wrapper around the underlying telebot.Bot. Holding it in
-// a struct lets us add fields later (e.g., database handle, AI client)
-// without changing the public API.
+// Bot is the GroceryGenie Telegram bot. It owns its dependencies
+// (Telegram client, AI agent, DB tools, session store) so handlers
+// can reach them via method receivers without globals.
 type Bot struct {
-	bot *tele.Bot
+	bot          *tele.Bot
+	receiptAgent *agents.ReceiptAgent
+	inventory    *tools.Inventory
+	sessions     *SessionStore
+
+	// Inline button definitions. Telebot keys handlers off these
+	// objects, so we keep them as fields to register handlers in
+	// one place and reference them when rendering keyboards.
+	btnAddMore   tele.Btn
+	btnDone      tele.Btn
+	btnCancel    tele.Btn
+	btnSkipAmbig tele.Btn
+	btnPayUPI    tele.Btn
+	btnPayCard   tele.Btn
+	btnPayCash   tele.Btn
 }
 
-// New creates and configures a Bot with the given token. It registers
-// the message handlers but does not start listening yet. Call Start()
-// to begin processing messages.
-//
-// The token is the long string BotFather gave you when you ran /newbot.
-func New(token string) (*Bot, error) {
-	// LongPoller: the bot will repeatedly ask Telegram "any new
-	// messages?" with a 10-second timeout. If a message arrives,
-	// Telegram returns it immediately. If not, the connection holds
-	// open for 10s before returning empty — this is called "long
-	// polling" and is efficient (no constant rapid-fire requests).
+// New creates and configures the bot. It registers all message
+// handlers and inline-button callbacks but does NOT start polling.
+// Call Start() to begin processing messages.
+func New(
+	token string,
+	receiptAgent *agents.ReceiptAgent,
+	inventory *tools.Inventory,
+	sessions *SessionStore,
+) (*Bot, error) {
 	settings := tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -45,114 +62,561 @@ func New(token string) (*Bot, error) {
 		return nil, fmt.Errorf("creating telegram bot: %w", err)
 	}
 
-	b := &Bot{bot: telebot}
+	b := &Bot{
+		bot:          telebot,
+		receiptAgent: receiptAgent,
+		inventory:    inventory,
+		sessions:     sessions,
+
+		// Inline button "Unique" IDs must be unique within the bot.
+		// They're used to identify which button was tapped.
+		btnAddMore:   tele.Btn{Unique: "order_add_more", Text: "📸 Add more"},
+		btnDone:      tele.Btn{Unique: "order_done", Text: "✅ Done"},
+		btnCancel:    tele.Btn{Unique: "order_cancel", Text: "❌ Cancel"},
+		btnSkipAmbig: tele.Btn{Unique: "ambig_skip", Text: "⏭ Skip this item"},
+		btnPayUPI:    tele.Btn{Unique: "pay_upi", Text: "💸 UPI"},
+		btnPayCard:   tele.Btn{Unique: "pay_card", Text: "💳 Card"},
+		btnPayCash:   tele.Btn{Unique: "pay_cash", Text: "💵 Cash"},
+	}
 	b.registerHandlers()
 	return b, nil
 }
 
-// registerHandlers wires each kind of incoming message to its handler.
-// Telebot's "/start" matches the literal /start command. tele.OnText
-// matches any text message that is NOT a command. tele.OnPhoto matches
-// any photo message.
-//
-// The bot.Use(...) line adds a "middleware" that runs before every
-// handler — we use it to log every incoming message. Middleware is a
-// common pattern: a function that wraps every handler with extra
-// behavior (logging, auth, rate limiting, etc.).
+// registerHandlers wires every message type and button to its handler.
 func (b *Bot) registerHandlers() {
 	b.bot.Use(b.logIncoming)
+
+	// Commands
 	b.bot.Handle("/start", b.handleStart)
-	b.bot.Handle("/stock", b.handleStockComingSoon)
 	b.bot.Handle("/help", b.handleHelp)
+	b.bot.Handle("/stock", b.handleStockComingSoon)
+	b.bot.Handle("/cancel", b.handleCancelCommand)
+
+	// Content types
 	b.bot.Handle(tele.OnText, b.handleText)
 	b.bot.Handle(tele.OnPhoto, b.handlePhoto)
+	b.bot.Handle(tele.OnDocument, b.handleDocument)
+
+	// Inline buttons (must register the pointer, not a copy)
+	b.bot.Handle(&b.btnAddMore, b.handleAddMore)
+	b.bot.Handle(&b.btnDone, b.handleDoneOrder)
+	b.bot.Handle(&b.btnCancel, b.handleCancelOrder)
+	b.bot.Handle(&b.btnSkipAmbig, b.handleSkipAmbiguous)
+	b.bot.Handle(&b.btnPayUPI, b.makePaymentHandler("UPI"))
+	b.bot.Handle(&b.btnPayCard, b.makePaymentHandler("Card"))
+	b.bot.Handle(&b.btnPayCash, b.makePaymentHandler("Cash"))
 }
 
-// logIncoming logs every incoming message so we can see activity in
-// the terminal. Returning next(c) hands off to the real handler.
+// logIncoming logs every incoming message — useful for debugging.
 func (b *Bot) logIncoming(next tele.HandlerFunc) tele.HandlerFunc {
 	return func(c tele.Context) error {
 		sender := c.Sender()
 		msg := c.Message()
 		switch {
-		case msg.Photo != nil:
+		case c.Callback() != nil:
+			log.Printf("🔘 from @%s (%s): button=%q",
+				sender.Username, sender.FirstName, c.Callback().Unique)
+		case msg != nil && msg.Photo != nil:
 			log.Printf("📷 from @%s (%s): [photo]", sender.Username, sender.FirstName)
-		case msg.Text != "":
+		case msg != nil && msg.Document != nil:
+			log.Printf("📎 from @%s (%s): [doc %s, %s]",
+				sender.Username, sender.FirstName, msg.Document.FileName, msg.Document.MIME)
+		case msg != nil && msg.Text != "":
 			log.Printf("💬 from @%s (%s): %q", sender.Username, sender.FirstName, msg.Text)
 		default:
-			log.Printf("📥 from @%s (%s): [other message type]", sender.Username, sender.FirstName)
+			log.Printf("📥 from @%s (%s): [other]", sender.Username, sender.FirstName)
 		}
 		return next(c)
 	}
 }
 
-// handleStart greets the user. This is what Telegram users see the
-// very first time they open the bot, when they tap the "Start" button.
+// ----------------------------------------------------------------------
+// Static commands
+// ----------------------------------------------------------------------
+
 func (b *Bot) handleStart(c tele.Context) error {
-	welcome := `Hi! I'm GroceryGenie 🛒
+	return c.Send(`Hi! I'm GroceryGenie 🛒
 
-I help you manage your household groceries.
+Send me a photo or PDF of a grocery receipt and I'll scan it.
 
-Right now I'm in early setup mode. I can already:
-• Echo your text messages (just so you know I'm alive)
-• Acknowledge photos (receipt scanning lands in the next step)
-
-Try /help to see what's coming.`
-	return c.Send(welcome)
+Try /help for everything I can do.`)
 }
 
-// handleHelp shows what the bot can (and will) do.
 func (b *Bot) handleHelp(c tele.Context) error {
-	help := `What I can do (Phase 1 in progress):
+	return c.Send(`*What I can do (Phase 1):*
 
-✅ Reply when you talk to me
-🔜 Scan receipt photos and log purchases
-🔜 Ask for payment method, platform if you skip
-🔜 Send an 8 PM nudge if you forget to log
+✅ Scan receipt photos and PDF invoices
+✅ Ask about items I couldn't read clearly
+✅ Confirm payment method with a tap
+✅ Save your order to inventory
 
-Coming in later phases:
+*Tips:*
+• For screenshots, send as a *file/document* (not photo) for better quality
+• Multi-photo orders: send each photo, then tap *Done* when finished
+• Tap *Cancel* at any point to abort
+
+*Coming next:*
 • Track meals you cook (Phase 2)
 • Saturday weekly shopping list (Phase 3)
 • Waste tracking + platform quality scores (Phase 4)
-• Monthly budget dashboard (Phase 5)
-• Guest mode + Kannada support for your cook (Phase 6)`
-	return c.Send(help)
+• Monthly budget dashboard (Phase 5)`, tele.ModeMarkdown)
 }
 
-// handleStockComingSoon is a stub for /stock until we build inventory
-// in step 5+. It exists so the command shows up in Telegram's UI.
 func (b *Bot) handleStockComingSoon(c tele.Context) error {
-	return c.Send("Stock tracking arrives in Phase 2. Hang tight!")
+	return c.Send("Stock queries arrive in Phase 2. Hang tight!")
 }
 
-// handleText is invoked for any text message that is not a command.
-// For now it just echoes — proving the message round-trip works.
-// Step 7+ replaces this with Gemini-powered intent parsing.
+// handleCancelCommand — text-based escape hatch in case the buttons
+// are inaccessible (older Telegram clients, etc.).
+func (b *Bot) handleCancelCommand(c tele.Context) error {
+	if b.sessions.Get(c.Sender().ID) == nil {
+		return c.Send("You don't have a pending order to cancel.")
+	}
+	b.sessions.Delete(c.Sender().ID)
+	return c.Send("❌ Order cancelled. Nothing was saved.")
+}
+
+// ----------------------------------------------------------------------
+// Text handler — also used for ambiguous-item replies
+// ----------------------------------------------------------------------
+
 func (b *Bot) handleText(c tele.Context) error {
-	reply := fmt.Sprintf(
-		"You said: %q\n\n(I'm just echoing right now. Meal/usage parsing lands in Phase 2.)",
+	order := b.sessions.Get(c.Sender().ID)
+	if order != nil && order.Stage == stageResolvingAmbiguous && order.CurrentAmbiguous != "" {
+		return b.applyAmbiguousAnswer(c, order, c.Text())
+	}
+
+	// No pending order — echo (intent parsing lands in Phase 2).
+	return c.Send(fmt.Sprintf(
+		"You said: %q\n\n(I echo for now. Send a receipt photo/PDF to try the real flow!)",
 		c.Text(),
-	)
-	return c.Send(reply)
+	))
 }
 
-// handlePhoto is invoked when the user sends a photo. Step 7 will
-// route this to Gemini Vision for receipt extraction. For now we just
-// confirm the bot received it.
+// ----------------------------------------------------------------------
+// Photo + document handlers — both route to processReceiptInput
+// ----------------------------------------------------------------------
+
 func (b *Bot) handlePhoto(c tele.Context) error {
-	return c.Send("Got your photo! 📸\n\nReceipt scanning is the very next thing I'm learning — coming in step 7.")
+	photo := c.Message().Photo
+	if photo == nil {
+		return c.Send("I expected a photo but didn't get one. Try again?")
+	}
+	return b.processReceiptInput(c, photo.File, "image/jpeg")
 }
 
-// Start begins polling Telegram for messages. This call blocks
-// forever (until Stop is called or the process is killed). Run this
-// from main() as the last thing.
+func (b *Bot) handleDocument(c tele.Context) error {
+	doc := c.Message().Document
+	if doc == nil {
+		return c.Send("I expected a file but didn't get one. Try again?")
+	}
+	mimeType := doc.MIME
+	if mimeType == "" {
+		mimeType = mimeFromName(doc.FileName)
+	}
+	if !strings.HasPrefix(mimeType, "image/") && mimeType != "application/pdf" {
+		return c.Send("I can read receipt images (JPG/PNG) and PDF invoices. " +
+			"This file looks like " + mimeType + " — could you send a photo or PDF instead?")
+	}
+	return b.processReceiptInput(c, doc.File, mimeType)
+}
+
+func (b *Bot) processReceiptInput(c tele.Context, file tele.File, mimeType string) error {
+	if err := c.Notify(tele.Typing); err != nil {
+		log.Printf("notify typing: %v", err)
+	}
+
+	statusMsg, err := b.bot.Send(c.Recipient(), "Scanning your receipt… 🔍")
+	if err != nil {
+		return fmt.Errorf("sending status message: %w", err)
+	}
+
+	fileBytes, err := b.downloadFile(file)
+	if err != nil {
+		log.Printf("downloading file: %v", err)
+		b.editOrSend(statusMsg, c, "Sorry, I couldn't download that file. Could you try again?")
+		return nil
+	}
+	log.Printf("downloaded %d bytes (%s)", len(fileBytes), mimeType)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	receipt, err := b.receiptAgent.Scan(ctx, fileBytes, mimeType)
+	if err != nil {
+		log.Printf("✗ scan failed: %v", err)
+		if errors.Is(err, agents.ErrTransient) {
+			b.editOrSend(statusMsg, c,
+				"⚠️ The AI service is busy right now (Google's free tier is in high demand).\n"+
+					"I already retried a few times. Could you send the receipt again in a minute?")
+			return nil
+		}
+		b.editOrSend(statusMsg, c,
+			"Hmm, I couldn't read this receipt. A few things to try:\n"+
+				"• Send as a *document/file* (not compressed photo) for screenshots\n"+
+				"• Make sure the full receipt is visible\n"+
+				"• PDF invoices work too — drag-drop the file into chat")
+		return nil
+	}
+	log.Printf("✓ scanned receipt: store=%q items=%d total=%.2f confidence=%.2f ambiguous=%d",
+		receipt.StoreName, len(receipt.Items), receipt.Total, receipt.Confidence, len(receipt.AmbiguousItems))
+
+	// Append to any existing pending order, or start a new one.
+	userID := c.Sender().ID
+	order := b.sessions.Get(userID)
+	if order == nil {
+		order = b.sessions.Create(userID)
+	}
+	b.sessions.Update(userID, func(o *PendingOrder) {
+		o.Items = append(o.Items, receipt.Items...)
+		o.Total += receipt.Total
+		if o.Store == "" {
+			o.Store = receipt.StoreName
+		}
+		if o.Date == "" {
+			o.Date = receipt.Date
+		}
+		o.Ambiguous = append(o.Ambiguous, receipt.AmbiguousItems...)
+	})
+
+	// First: replace the "Scanning…" message with the scan result.
+	b.editOrSend(statusMsg, c, formatScanSummary(receipt))
+
+	// Then: drive the next step (ambiguous Q&A or order summary).
+	return b.advanceFlow(c)
+}
+
+// advanceFlow decides what to send next based on session state.
+// Called after every photo and after every ambiguous-item resolution.
+func (b *Bot) advanceFlow(c tele.Context) error {
+	order := b.sessions.Get(c.Sender().ID)
+	if order == nil {
+		return nil
+	}
+	if len(order.Ambiguous) > 0 {
+		return b.askNextAmbiguous(c, order)
+	}
+	return b.showOrderSummary(c, order)
+}
+
+// askNextAmbiguous pops the next ambiguous item and asks about it.
+func (b *Bot) askNextAmbiguous(c tele.Context, order *PendingOrder) error {
+	next := order.Ambiguous[0]
+	b.sessions.Update(order.UserID, func(o *PendingOrder) {
+		o.Ambiguous = o.Ambiguous[1:]
+		o.CurrentAmbiguous = next
+		o.Stage = stageResolvingAmbiguous
+	})
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(b.btnSkipAmbig), markup.Row(b.btnCancel))
+
+	return c.Send(fmt.Sprintf(
+		"⚠️ I couldn't read *%s* clearly. What was it? Reply with the correct quantity/name, or tap Skip.",
+		next,
+	), markup, tele.ModeMarkdown)
+}
+
+// applyAmbiguousAnswer accepts the user's clarification for the
+// currently-asked ambiguous item. For MVP we just store the text in
+// the item name; future versions will parse "4 pieces" into qty+unit.
+func (b *Bot) applyAmbiguousAnswer(c tele.Context, order *PendingOrder, answer string) error {
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return c.Send("Couldn't parse that — try again, or tap Skip.")
+	}
+
+	b.sessions.Update(order.UserID, func(o *PendingOrder) {
+		// MVP: treat the user's reply as the corrected item name and
+		// add it as a new countable item with quantity 1. Full NLP
+		// parsing of "4 pieces of carrots" lands in Phase 2 alongside
+		// the usage-logging Gemini agent.
+		o.Items = append(o.Items, agents.ReceiptItem{
+			Name:         strings.ToLower(answer),
+			Quantity:     1,
+			Unit:         "pieces",
+			Category:     "other",
+			TrackingType: "countable",
+		})
+		o.CurrentAmbiguous = ""
+		o.Stage = stageCollectingPhotos
+	})
+
+	if err := c.Send(fmt.Sprintf("✓ Got it: %q added to the order.", answer)); err != nil {
+		return err
+	}
+	return b.advanceFlow(c)
+}
+
+// handleSkipAmbiguous — user tapped Skip on the current ambiguous item.
+func (b *Bot) handleSkipAmbiguous(c tele.Context) error {
+	_ = c.Respond() // acknowledge the button tap so the spinner goes away
+
+	order := b.sessions.Get(c.Sender().ID)
+	if order == nil {
+		return c.Send("This order's session has expired. Send a fresh receipt to start over.")
+	}
+	b.sessions.Update(order.UserID, func(o *PendingOrder) {
+		o.CurrentAmbiguous = ""
+		o.Stage = stageCollectingPhotos
+	})
+
+	// Remove the inline keyboard from the prior question — visual cue
+	// that we've moved on.
+	if c.Message() != nil {
+		_, _ = b.bot.Edit(c.Message(), c.Message().Text+"\n_(skipped)_", tele.ModeMarkdown)
+	}
+
+	return b.advanceFlow(c)
+}
+
+// ----------------------------------------------------------------------
+// Order summary + action buttons (Add more / Done / Cancel)
+// ----------------------------------------------------------------------
+
+func (b *Bot) showOrderSummary(c tele.Context, order *PendingOrder) error {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(
+		markup.Row(b.btnAddMore, b.btnDone),
+		markup.Row(b.btnCancel),
+	)
+	return c.Send(formatOrderSummary(order), markup, tele.ModeMarkdown)
+}
+
+func (b *Bot) handleAddMore(c tele.Context) error {
+	_ = c.Respond()
+	if b.sessions.Get(c.Sender().ID) == nil {
+		return c.Send("Your session has expired. Start with a fresh receipt photo.")
+	}
+	return c.Send("📸 Sure — send the next photo/PDF whenever you're ready.")
+}
+
+func (b *Bot) handleCancelOrder(c tele.Context) error {
+	_ = c.Respond()
+	order := b.sessions.Get(c.Sender().ID)
+	if order == nil {
+		return c.Send("No pending order to cancel.")
+	}
+	b.sessions.Delete(order.UserID)
+	if c.Message() != nil {
+		_, _ = b.bot.Edit(c.Message(), "❌ Order cancelled. Nothing saved.")
+	}
+	return nil
+}
+
+func (b *Bot) handleDoneOrder(c tele.Context) error {
+	_ = c.Respond()
+	order := b.sessions.Get(c.Sender().ID)
+	if order == nil {
+		return c.Send("No pending order. Send a receipt photo to begin.")
+	}
+	if len(order.Items) == 0 {
+		return c.Send("No items in the order yet — please send a receipt first.")
+	}
+
+	b.sessions.Update(order.UserID, func(o *PendingOrder) {
+		o.Stage = stageAwaitingPayment
+	})
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(
+		markup.Row(b.btnPayUPI, b.btnPayCard, b.btnPayCash),
+		markup.Row(b.btnCancel),
+	)
+
+	store := order.Store
+	if store == "" {
+		store = "this order"
+	}
+	prompt := fmt.Sprintf(
+		"💳 *How did you pay* for %s?\n_(Rs %.2f total)_",
+		store, order.Total,
+	)
+	sent, err := b.bot.Send(c.Recipient(), prompt, markup, tele.ModeMarkdown)
+	if err == nil && sent != nil {
+		b.sessions.Update(order.UserID, func(o *PendingOrder) {
+			o.PaymentBtnMsgID = sent.ID
+		})
+	}
+	return err
+}
+
+// ----------------------------------------------------------------------
+// Payment buttons → save to DB → confirmation message
+// ----------------------------------------------------------------------
+
+// makePaymentHandler returns a handler bound to a specific payment
+// method label. Using a factory avoids three near-identical methods.
+func (b *Bot) makePaymentHandler(method string) tele.HandlerFunc {
+	return func(c tele.Context) error {
+		_ = c.Respond()
+		order := b.sessions.Get(c.Sender().ID)
+		if order == nil {
+			return c.Send("Your session expired. Start with a fresh receipt.")
+		}
+
+		// Edit the payment-buttons message to a "Saving…" status,
+		// preventing accidental double-taps and showing progress.
+		if c.Message() != nil {
+			_, _ = b.bot.Edit(c.Message(), fmt.Sprintf("💳 Payment: *%s* — saving order…", method), tele.ModeMarkdown)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		saved, err := b.inventory.SaveConfirmedOrder(
+			ctx, order.Items, order.Store, method, "", // receipt_image_ref TODO once we store images
+		)
+		if err != nil {
+			log.Printf("save failed: %v", err)
+			if c.Message() != nil {
+				_, _ = b.bot.Edit(c.Message(), "❌ Something went wrong saving the order. Please try again.")
+			}
+			return nil
+		}
+
+		b.sessions.Delete(order.UserID)
+
+		// Replace the "Saving…" status with the success summary.
+		summary := formatSaveSuccess(order.Store, method, saved)
+		if c.Message() != nil {
+			_, err = b.bot.Edit(c.Message(), summary, tele.ModeMarkdown)
+			return err
+		}
+		return c.Send(summary, tele.ModeMarkdown)
+	}
+}
+
+// ----------------------------------------------------------------------
+// File download + small helpers
+// ----------------------------------------------------------------------
+
+func (b *Bot) downloadFile(file tele.File) ([]byte, error) {
+	rc, err := b.bot.File(&file)
+	if err != nil {
+		return nil, fmt.Errorf("getting file reader: %w", err)
+	}
+	defer rc.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rc); err != nil {
+		return nil, fmt.Errorf("reading file bytes: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func (b *Bot) editOrSend(statusMsg *tele.Message, c tele.Context, text string) {
+	if statusMsg != nil {
+		if _, err := b.bot.Edit(statusMsg, text, tele.ModeMarkdown); err == nil {
+			return
+		} else {
+			log.Printf("edit failed, sending new message instead: %v", err)
+		}
+	}
+	if err := c.Send(text, tele.ModeMarkdown); err != nil {
+		log.Printf("send fallback failed: %v", err)
+	}
+}
+
+func mimeFromName(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(lower, ".pdf"):
+		return "application/pdf"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(lower, ".png"):
+		return "image/png"
+	case strings.HasSuffix(lower, ".webp"):
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// ----------------------------------------------------------------------
+// Formatting helpers (kept at the bottom — they're pure functions
+// that don't depend on Bot state, easy to unit-test later)
+// ----------------------------------------------------------------------
+
+func formatScanSummary(r *agents.Receipt) string {
+	var sb strings.Builder
+	store := r.StoreName
+	if store == "" {
+		store = "_unknown store_"
+	}
+	sb.WriteString(fmt.Sprintf("📄 *Scanned* — %s", store))
+	if r.Date != "" {
+		sb.WriteString(fmt.Sprintf(" (%s)", r.Date))
+	}
+	sb.WriteString("\n\n")
+	if len(r.Items) == 0 {
+		sb.WriteString("Didn't find any items. Try a clearer photo.")
+		return sb.String()
+	}
+	sb.WriteString("*Items in this photo:*\n")
+	for _, it := range r.Items {
+		sb.WriteString(formatItemLine(it))
+	}
+	if r.Total > 0 {
+		sb.WriteString(fmt.Sprintf("\n_Photo total: Rs %.2f_", r.Total))
+	}
+	return sb.String()
+}
+
+func formatOrderSummary(o *PendingOrder) string {
+	var sb strings.Builder
+	store := o.Store
+	if store == "" {
+		store = "_unknown store_"
+	}
+	sb.WriteString(fmt.Sprintf("📦 *Order so far — %s*\n", store))
+	sb.WriteString(fmt.Sprintf("%d item(s), Rs %.2f\n\n", len(o.Items), o.Total))
+	for _, it := range o.Items {
+		sb.WriteString(formatItemLine(it))
+	}
+	sb.WriteString("\n_Tap below to add more photos, finish, or cancel._")
+	return sb.String()
+}
+
+func formatItemLine(it agents.ReceiptItem) string {
+	qty := fmt.Sprintf("%g", it.Quantity)
+	if it.Unit != "" {
+		qty = fmt.Sprintf("%s %s", qty, it.Unit)
+	}
+	line := fmt.Sprintf("  • %s %s", qty, it.Name)
+	if it.Price > 0 {
+		line += fmt.Sprintf(" — Rs %.0f", it.Price)
+	}
+	if it.TrackingType != "" {
+		line += fmt.Sprintf(" _(%s)_", it.TrackingType)
+	}
+	return line + "\n"
+}
+
+func formatSaveSuccess(store, paymentMethod string, saved []tools.SavedPurchase) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("✅ *Saved!* %d items from %s via %s\n\n",
+		len(saved), store, paymentMethod))
+	sb.WriteString("*Stock updated:*\n")
+	for _, s := range saved {
+		if s.TrackingType == "estimated" {
+			sb.WriteString(fmt.Sprintf("  • %s — tracked by purchase cycle\n", s.ItemName))
+		} else {
+			sb.WriteString(fmt.Sprintf("  • %s — %g %s in stock\n", s.ItemName, s.NewStock, s.Unit))
+		}
+	}
+	return sb.String()
+}
+
+// ----------------------------------------------------------------------
+// Lifecycle
+// ----------------------------------------------------------------------
+
 func (b *Bot) Start() {
 	log.Println("Telegram bot listening for messages...")
-	b.bot.Start() // blocks
+	b.bot.Start()
 }
 
-// Stop gracefully shuts down the polling loop. Useful for signal
-// handlers (Ctrl+C) — we will hook this up in a later step.
 func (b *Bot) Stop() {
 	b.bot.Stop()
 }
