@@ -1,0 +1,33 @@
+# Environment & secrets — NEVER commit
+.env
+.env.local
+*.key
+secrets/
+
+# Database files (local data)
+*.db
+*.sqlite
+*.sqlite3
+
+# Go build artifacts
+bin/
+*.exe
+*.test
+*.out
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs
+*.log
+logs/
+
+# Receipt images uploaded for testing
+evals/receipt_samples/personal/
+
+# Claude session data (project memory, not source)
+.claude/
