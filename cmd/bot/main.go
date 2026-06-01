@@ -19,6 +19,7 @@ import (
 
 	"github.com/kaustubhi-shukla/grocery-genie/internal/agents"
 	"github.com/kaustubhi-shukla/grocery-genie/internal/database"
+	"github.com/kaustubhi-shukla/grocery-genie/internal/scheduler"
 	"github.com/kaustubhi-shukla/grocery-genie/internal/telegram"
 	"github.com/kaustubhi-shukla/grocery-genie/internal/tools"
 )
@@ -67,9 +68,17 @@ func main() {
 	}
 	defer receiptAgent.Close()
 
-	// Inventory toolset — turns DB writes into discrete operations
-	// the bot can call (SaveConfirmedOrder, future stock queries).
+	// Indian Standard Time — used by the activity tracker and cron
+	// schedules to compute "today" and to fire the 8 PM nudge.
+	istLoc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		log.Fatalf("loading Asia/Kolkata timezone: %v", err)
+	}
+
+	// Toolsets — small structs that wrap the DB with named operations.
 	inventory := tools.NewInventory(db)
+	activity := tools.NewActivity(db, istLoc)
+	settings := tools.NewSettings(db)
 
 	// Session store keeps in-progress orders in memory between the
 	// initial scan and the final payment confirmation. 10-min TTL —
@@ -78,10 +87,19 @@ func main() {
 	defer sessions.Close()
 
 	// Build the bot, passing everything its handlers need.
-	bot, err := telegram.New(token, receiptAgent, inventory, sessions)
+	bot, err := telegram.New(token, receiptAgent, inventory, activity, settings, sessions)
 	if err != nil {
 		log.Fatalf("creating telegram bot: %v", err)
 	}
+
+	// Scheduler runs in-process cron jobs (8 PM nudge for now,
+	// Saturday reports + subscription alerts in later phases).
+	// We pass the bot as the Notifier — it implements NotifyOwner.
+	sched := scheduler.New(istLoc, activity, bot)
+	if err := sched.Start(); err != nil {
+		log.Fatalf("starting scheduler: %v", err)
+	}
+	defer sched.Stop()
 
 	log.Println("GroceryGenie starting up — press Ctrl+C to stop")
 	// bot.Start() blocks forever. Anything below this line never runs

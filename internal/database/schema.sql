@@ -161,6 +161,18 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 );
 
 -- =============================================================
+-- TABLE: bot_settings
+-- Simple key-value store for bot-wide config. Used to remember the
+-- Telegram chat ID for the owner (so the 8 PM nudge knows where to
+-- post) and any future single-row settings (active budget, etc.).
+-- =============================================================
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- =============================================================
 -- INDEXES
 -- Indexes speed up common queries. Without an index, the database
 -- has to scan every row. With an index, it can jump directly to

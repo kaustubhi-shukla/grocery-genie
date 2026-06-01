@@ -29,6 +29,8 @@ type Bot struct {
 	bot          *tele.Bot
 	receiptAgent *agents.ReceiptAgent
 	inventory    *tools.Inventory
+	activity     *tools.Activity
+	settings     *tools.Settings
 	sessions     *SessionStore
 
 	// Inline button definitions. Telebot keys handlers off these
@@ -50,14 +52,16 @@ func New(
 	token string,
 	receiptAgent *agents.ReceiptAgent,
 	inventory *tools.Inventory,
+	activity *tools.Activity,
+	settings *tools.Settings,
 	sessions *SessionStore,
 ) (*Bot, error) {
-	settings := tele.Settings{
+	teleConfig := tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 	}
 
-	telebot, err := tele.NewBot(settings)
+	telebot, err := tele.NewBot(teleConfig)
 	if err != nil {
 		return nil, fmt.Errorf("creating telegram bot: %w", err)
 	}
@@ -66,6 +70,8 @@ func New(
 		bot:          telebot,
 		receiptAgent: receiptAgent,
 		inventory:    inventory,
+		activity:     activity,
+		settings:     settings,
 		sessions:     sessions,
 
 		// Inline button "Unique" IDs must be unique within the bot.
@@ -91,6 +97,7 @@ func (b *Bot) registerHandlers() {
 	b.bot.Handle("/help", b.handleHelp)
 	b.bot.Handle("/stock", b.handleStockComingSoon)
 	b.bot.Handle("/cancel", b.handleCancelCommand)
+	b.bot.Handle("/testnudge", b.handleTestNudge)
 
 	// Content types
 	b.bot.Handle(tele.OnText, b.handleText)
@@ -135,6 +142,18 @@ func (b *Bot) logIncoming(next tele.HandlerFunc) tele.HandlerFunc {
 // ----------------------------------------------------------------------
 
 func (b *Bot) handleStart(c tele.Context) error {
+	// Remember the chat ID so the 8 PM nudge knows where to post.
+	// Telegram's c.Chat() returns the chat (DM or group) the message
+	// arrived from. For a private bot, that's the user's DM with us.
+	if c.Chat() != nil && b.settings != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		chatIDStr := fmt.Sprintf("%d", c.Chat().ID)
+		if err := b.settings.Set(ctx, tools.KeyOwnerChatID, chatIDStr); err != nil {
+			log.Printf("saving owner chat id: %v", err)
+		}
+	}
+
 	return c.Send(`Hi! I'm GroceryGenie 🛒
 
 Send me a photo or PDF of a grocery receipt and I'll scan it.
@@ -164,6 +183,23 @@ func (b *Bot) handleHelp(c tele.Context) error {
 
 func (b *Bot) handleStockComingSoon(c tele.Context) error {
 	return c.Send("Stock queries arrive in Phase 2. Hang tight!")
+}
+
+// handleTestNudge — developer command to verify the 8 PM nudge
+// wiring without waiting for actual 8 PM. Triggers the same code
+// path as the scheduled job.
+func (b *Bot) handleTestNudge(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	msg := `🌙 *Daily logging nudge (test fire)*
+
+This is what the 8 PM nudge looks like. The real one only fires if you haven't logged anything that day.`
+
+	if err := b.NotifyOwner(ctx, msg); err != nil {
+		return c.Send(fmt.Sprintf("Test nudge failed: %v", err))
+	}
+	return c.Send("✓ Test nudge sent (check above).")
 }
 
 // handleCancelCommand — text-based escape hatch in case the buttons
@@ -477,6 +513,13 @@ func (b *Bot) makePaymentHandler(method string) tele.HandlerFunc {
 
 		b.sessions.Delete(order.UserID)
 
+		// Mark today as "logged" — keeps the 8 PM nudge from firing.
+		if b.activity != nil {
+			if err := b.activity.MarkLogged(ctx); err != nil {
+				log.Printf("marking activity: %v", err)
+			}
+		}
+
 		// Replace the "Saving…" status with the success summary.
 		summary := formatSaveSuccess(order.Store, method, saved)
 		if c.Message() != nil {
@@ -619,4 +662,31 @@ func (b *Bot) Start() {
 
 func (b *Bot) Stop() {
 	b.bot.Stop()
+}
+
+// NotifyOwner sends a Markdown message to the owner's chat. Used by
+// the scheduler for the 8 PM nudge and (later) Saturday reports.
+// Implements scheduler.Notifier.
+func (b *Bot) NotifyOwner(ctx context.Context, text string) error {
+	if b.settings == nil {
+		return fmt.Errorf("settings store not configured")
+	}
+	chatIDStr, err := b.settings.Get(ctx, tools.KeyOwnerChatID)
+	if err != nil {
+		return fmt.Errorf("looking up owner chat id: %w", err)
+	}
+	if chatIDStr == "" {
+		return fmt.Errorf("owner chat id not set — owner has not /start'd the bot yet")
+	}
+
+	var chatID int64
+	if _, err := fmt.Sscanf(chatIDStr, "%d", &chatID); err != nil {
+		return fmt.Errorf("parsing chat id %q: %w", chatIDStr, err)
+	}
+
+	chat := &tele.Chat{ID: chatID}
+	if _, err := b.bot.Send(chat, text, tele.ModeMarkdown); err != nil {
+		return fmt.Errorf("sending to owner chat %d: %w", chatID, err)
+	}
+	return nil
 }
