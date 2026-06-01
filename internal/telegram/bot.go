@@ -97,7 +97,6 @@ func (b *Bot) registerHandlers() {
 	b.bot.Handle("/help", b.handleHelp)
 	b.bot.Handle("/stock", b.handleStockComingSoon)
 	b.bot.Handle("/cancel", b.handleCancelCommand)
-	b.bot.Handle("/testnudge", b.handleTestNudge)
 
 	// Content types
 	b.bot.Handle(tele.OnText, b.handleText)
@@ -183,23 +182,6 @@ func (b *Bot) handleHelp(c tele.Context) error {
 
 func (b *Bot) handleStockComingSoon(c tele.Context) error {
 	return c.Send("Stock queries arrive in Phase 2. Hang tight!")
-}
-
-// handleTestNudge — developer command to verify the 8 PM nudge
-// wiring without waiting for actual 8 PM. Triggers the same code
-// path as the scheduled job.
-func (b *Bot) handleTestNudge(c tele.Context) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	msg := `🌙 *Daily logging nudge (test fire)*
-
-This is what the 8 PM nudge looks like. The real one only fires if you haven't logged anything that day.`
-
-	if err := b.NotifyOwner(ctx, msg); err != nil {
-		return c.Send(fmt.Sprintf("Test nudge failed: %v", err))
-	}
-	return c.Send("✓ Test nudge sent (check above).")
 }
 
 // handleCancelCommand — text-based escape hatch in case the buttons

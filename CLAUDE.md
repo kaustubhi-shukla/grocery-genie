@@ -2,6 +2,36 @@
 
 > This document is the single source of truth for this project. Use it to start new sessions without hallucinations. Everything decided is here; everything not mentioned is undecided.
 
+## Implementation status
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1 | Foundation + Receipt Scanning + Confirmation + 8 PM Nudge | **✅ Complete** (tagged `v0.1.0`) |
+| 2 | Usage Tracking + NLP meal logging | Not started |
+| 3 | Smart Reminders + Subscription Detection | Not started |
+| 4 | Waste Tracking + Platform Quality | Not started |
+| 5 | Budget + Spend Intelligence | Not started |
+| 6 | Guest Mode + Cook Access (Kannada) | Not started |
+
+**What Phase 1 actually delivered (matches PRD F1.1–F1.7):**
+- Telegram bot (`@kaustubhi_grocery_bot`)
+- Receipt scanning via Gemini 2.5 Flash (images + PDFs)
+- Multi-photo orders merged into one session (10-min TTL)
+- Ambiguous-item resolution one at a time (with Skip)
+- Inline buttons: Add more / Done / Cancel / payment method
+- DB persistence: items auto-created, purchases logged, inventory upserted (countable adds, estimated replaces)
+- 8 PM IST daily nudge via robfig/cron (idempotent — once per day max)
+- In-place message editing for clean UX (Scanning… → Saved!)
+- Exponential-backoff retry on Gemini 503/UNAVAILABLE
+- Logs tee'd to `bot.log` for debugging
+
+**Known gaps (deferred to later phases):**
+- No NLP text parsing yet (Phase 2)
+- No /stock query yet (Phase 2)
+- No Saturday report yet (Phase 3)
+- No waste, budget, guest, cook features yet (Phases 4–6)
+- No ADK agent framework yet — we use Gemini SDK directly. ADK will be introduced in Phase 2 when we have multiple agents to coordinate.
+
 ## What is this?
 
 GroceryGenie is a **Telegram bot** that acts as a conversational grocery inventory manager for an urban Indian household (Bengaluru). The user (a household manager with a cook/maid) texts the bot about what they bought, cooked, and wasted. The bot tracks inventory, predicts when items will run out, and sends a weekly shopping list every Saturday.
