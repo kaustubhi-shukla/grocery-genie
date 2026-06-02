@@ -484,6 +484,7 @@ func (b *Bot) makePaymentHandler(method string) tele.HandlerFunc {
 
 		saved, err := b.inventory.SaveConfirmedOrder(
 			ctx, order.Items, order.Store, method, "", // receipt_image_ref TODO once we store images
+			order.Date, // empty string = "now"; otherwise YYYY-MM-DD from Gemini
 		)
 		if err != nil {
 			log.Printf("save failed: %v", err)
@@ -595,11 +596,21 @@ func formatOrderSummary(o *PendingOrder) string {
 		store = "_unknown store_"
 	}
 	sb.WriteString(fmt.Sprintf("📦 *Order so far — %s*\n", store))
+
+	// Show the date Gemini extracted (or note that it's missing) so
+	// the user can spot wrong dates BEFORE saving — critical when
+	// uploading historical receipts.
+	if o.Date != "" {
+		sb.WriteString(fmt.Sprintf("🗓 Date: *%s*\n", o.Date))
+	} else {
+		sb.WriteString("🗓 Date: _not detected — will use today_\n")
+	}
 	sb.WriteString(fmt.Sprintf("%d item(s), Rs %.2f\n\n", len(o.Items), o.Total))
 	for _, it := range o.Items {
 		sb.WriteString(formatItemLine(it))
 	}
 	sb.WriteString("\n_Tap below to add more photos, finish, or cancel._")
+	sb.WriteString("\n_If the date above is wrong for a historical receipt, cancel and reply with the date in your next message — date editing lands in the next iteration._")
 	return sb.String()
 }
 

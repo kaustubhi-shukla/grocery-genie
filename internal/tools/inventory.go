@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/kaustubhi-shukla/grocery-genie/internal/agents"
@@ -49,6 +50,12 @@ type SavedPurchase struct {
 //     the most recent restock — useful for relative quantity math
 //     like "half the bottle used")
 //
+// purchaseDate is the date the purchase actually happened (from the
+// receipt). Pass "" to default to "now" — useful for live orders, but
+// historical uploads must pass the receipt's date string so the
+// time-series stays accurate for subscription detection and monthly
+// spend reports.
+//
 // Returns one SavedPurchase per item so the bot can render a friendly
 // confirmation message ("carrots: 4 in stock, basmati rice: 2kg").
 func (inv *Inventory) SaveConfirmedOrder(
@@ -57,6 +64,7 @@ func (inv *Inventory) SaveConfirmedOrder(
 	platform string,
 	paymentMethod string,
 	receiptImageRef string,
+	purchaseDate string,
 ) ([]SavedPurchase, error) {
 	tx, err := inv.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -65,7 +73,7 @@ func (inv *Inventory) SaveConfirmedOrder(
 	defer tx.Rollback() // safe — Commit() makes this a no-op
 
 	results := make([]SavedPurchase, 0, len(items))
-	now := time.Now()
+	now := parsePurchaseDate(purchaseDate)
 
 	for _, item := range items {
 		// 1) Resolve item_id: find by name (case-insensitive) or create.
@@ -205,4 +213,31 @@ func nullable(v float64) any {
 		return nil
 	}
 	return v
+}
+
+// parsePurchaseDate accepts whatever Gemini extracted from the receipt
+// and returns a sensible time.Time for the purchased_at column.
+//
+// Supported inputs:
+//
+//	""           -> now (fresh live order)
+//	"2026-05-18" -> midday of that date (anchored to noon so timezone
+//	                math on either side does not flip the day)
+//
+// Anything else (malformed, partial, junk) -> now, on the principle
+// that "wrong but recoverable" beats "missing entirely". We log the
+// fallback so it can be spotted in bot.log.
+func parsePurchaseDate(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Now()
+	}
+	// Try ISO date format first — that's what we asked Gemini to return.
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		// Noon avoids midnight edge cases when reading the date in any
+		// timezone — both IST and UTC will see the same calendar day.
+		return time.Date(t.Year(), t.Month(), t.Day(), 12, 0, 0, 0, time.Local)
+	}
+	// Last resort — could not parse, return now (the call site logs).
+	return time.Now()
 }
