@@ -514,12 +514,29 @@ func (b *Bot) processReceiptInput(c tele.Context, file tele.File, mimeType strin
 	receipt, err := b.receiptAgent.Scan(ctx, fileBytes, mimeType)
 	if err != nil {
 		log.Printf("✗ scan failed: %v", err)
+
+		// Three distinct failure modes, three distinct user messages.
+
+		if errors.Is(err, agents.ErrQuotaExhausted) {
+			b.editOrSend(statusMsg, c,
+				"🛑 *Daily AI quota hit.*\n\n"+
+					"Google's free tier limits how many receipts I can scan per day. "+
+					"You've used today's allowance.\n\n"+
+					"Options:\n"+
+					"• Wait until the daily quota resets (~12:30 PM IST tomorrow)\n"+
+					"• Enable billing in Google AI Studio for higher limits\n"+
+					"• Ask me to switch to a higher-quota model if accuracy permits\n\n"+
+					"_Your already-saved data is safe — nothing here uses the quota._")
+			return nil
+		}
+
 		if errors.Is(err, agents.ErrTransient) {
 			b.editOrSend(statusMsg, c,
 				"⚠️ The AI service is busy right now (Google's free tier is in high demand).\n"+
 					"I already retried a few times. Could you send the receipt again in a minute?")
 			return nil
 		}
+
 		b.editOrSend(statusMsg, c,
 			"Hmm, I couldn't read this receipt. A few things to try:\n"+
 				"• Send as a *document/file* (not compressed photo) for screenshots\n"+

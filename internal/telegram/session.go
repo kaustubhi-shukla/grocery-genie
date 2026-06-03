@@ -16,6 +16,7 @@
 package telegram
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -166,22 +167,34 @@ func (s *SessionStore) MergeOrQueue(userID int64, receipt *agents.Receipt, thres
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	log.Printf("[MergeOrQueue] called: userID=%d threshold=%v incoming_items=%d",
+		userID, threshold, len(receipt.Items))
+
 	o, ok := s.orders[userID]
 	if !ok || time.Since(o.UpdatedAt) > s.ttl {
+		log.Printf("[MergeOrQueue] no existing session (ok=%v) — creating fresh", ok)
 		o = &PendingOrder{
 			UserID: userID,
 			Stage:  stageCollectingPhotos,
 		}
 		s.orders[userID] = o
+	} else {
+		log.Printf("[MergeOrQueue] existing session: items=%d total=%.2f lastScan=%v queued=%d",
+			len(o.Items), o.Total, o.LastScanFinishedAt, len(o.QueuedScans))
 	}
 
 	now := time.Now()
+	delta := now.Sub(o.LastScanFinishedAt)
 	isBulk := len(o.Items) > 0 &&
 		!o.LastScanFinishedAt.IsZero() &&
-		now.Sub(o.LastScanFinishedAt) < threshold
+		delta < threshold
+
+	log.Printf("[MergeOrQueue] decision: items=%d lastScanZero=%v delta=%v threshold=%v → isBulk=%v",
+		len(o.Items), o.LastScanFinishedAt.IsZero(), delta, threshold, isBulk)
 
 	if isBulk {
 		o.QueuedScans = append(o.QueuedScans, receipt)
+		log.Printf("[MergeOrQueue] QUEUED → queue now has %d receipt(s)", len(o.QueuedScans))
 	} else {
 		o.Items = append(o.Items, receipt.Items...)
 		o.Total += receipt.Total
@@ -192,6 +205,8 @@ func (s *SessionStore) MergeOrQueue(userID int64, receipt *agents.Receipt, thres
 			o.Date = receipt.Date
 		}
 		o.Ambiguous = append(o.Ambiguous, receipt.AmbiguousItems...)
+		log.Printf("[MergeOrQueue] MERGED → session now has %d items, total=%.2f",
+			len(o.Items), o.Total)
 	}
 
 	o.LastScanFinishedAt = now
