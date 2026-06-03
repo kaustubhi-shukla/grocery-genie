@@ -12,7 +12,8 @@ Return ONLY a JSON object matching this schema (no prose, no markdown fences):
       "unit": "pieces | kg | g | litres | ml | packets | dozen | bunch",
       "price": number | null,
       "category": "vegetable | fruit | grain | spice | dairy | oil | snacks | beverage | toiletry | other",
-      "tracking_type": "countable | estimated"
+      "tracking_type": "countable | estimated",
+      "is_freebie": boolean
     }
   ],
   "total": number | null,
@@ -40,13 +41,29 @@ CRITICAL RULES:
    - Parse what's printed. "5 KG" → quantity: 5, unit: "kg".
    - "4" with no unit on a vegetable line → quantity: 4, unit: "pieces"
    - If the unit on the receipt is ambiguous (e.g. just "500" with no g/ml), set unit to null and add to ambiguous_items.
+   - "1 pack" / "1 bunch" of items that typically come in multi-piece units
+     (bananas, eggs, mushrooms) is fine — record the pack/bunch as 1 with
+     the printed unit, AND add the item to ambiguous_items so the user
+     can specify how many pieces the pack contained. Do NOT guess pack
+     contents from generic knowledge.
+   - "2 dozen" → quantity: 2, unit: "dozen" (do NOT convert to pieces here;
+     downstream code handles unit math).
 
-5. confidence score:
+5. Freebies / complimentary items:
+   - If a line item shows "FREE", "Complimentary", "Sample", "Gift",
+     "₹0", "Rs 0", strike-through pricing, or "(Free with order)",
+     set is_freebie: true AND price: 0.
+   - Default is_freebie: false for paid items.
+   - Freebies are still ITEMS — extract them like any other product
+     (name, quantity, unit). Downstream code excludes them from
+     replenishment forecasting but still tracks them in inventory.
+
+6. confidence score:
    - 0.9+: receipt is clear, all values extracted with certainty
    - 0.7-0.9: most items clear, some prices/units guessed from context
    - <0.7: photo quality issues, illegible text, partial receipt
 
-6. Store name:
+7. Store name:
    - Recognize common Indian retailers: FirstClub, Zepto, Blinkit, Swiggy Instamart, BigBasket, Reliance Smart, DMart, More, Amazon Fresh, Flipkart Minutes
    - PREFER the consumer-facing brand name over the legal entity name. Examples:
      * "TROLLEYPOP RETAIL PRIVATE LIMITED" → "FirstClub"
@@ -60,6 +77,6 @@ CRITICAL RULES:
      that confirms the brand.
    - If unrecognizable, set to null (the user will be asked to confirm)
 
-7. Skip non-item lines: GST, CGST, SGST, discounts, delivery fees, tips. Only product line items.
+8. Skip non-item lines: GST, CGST, SGST, discounts, delivery fees, tips. Only product line items.
 
 Return ONLY the JSON object. No explanation, no markdown fences, no commentary.

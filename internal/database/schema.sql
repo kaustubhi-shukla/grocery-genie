@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS purchases (
     receipt_image   TEXT,                                  -- Telegram file_id of receipt photo
     is_confirmed    BOOLEAN NOT NULL DEFAULT 0,            -- user confirmed platform/details
     is_guest_event  BOOLEAN NOT NULL DEFAULT 0,            -- TRUE = party/festival purchase, excluded from interval calc
+    is_freebie      BOOLEAN NOT NULL DEFAULT 0,            -- TRUE = complimentary / Rs 0 item; excluded from interval, depletion, and price math
     purchased_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

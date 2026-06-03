@@ -89,14 +89,23 @@ func (inv *Inventory) SaveConfirmedOrder(
 			ppu := item.Price / item.Quantity
 			pricePerUnit = &ppu
 		}
+		// Mark items as freebies when EITHER Gemini explicitly flagged
+		// them (FREE / complimentary markers on the receipt) OR price
+		// was 0 (paid-for items always have a positive price). Either
+		// signal alone is enough — both belt and braces protect us
+		// from prompt drift in future Gemini versions.
+		// Freebies still update inventory (we have them in the pantry)
+		// but must be excluded from subscription, depletion, and
+		// price-per-unit math.
+		isFreebie := item.IsFreebie || item.Price == 0
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO purchases (
 				item_id, quantity, price, price_per_unit,
 				platform, payment_method, receipt_image,
-				is_confirmed, purchased_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+				is_confirmed, is_freebie, purchased_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 			itemID, item.Quantity, nullable(item.Price), pricePerUnit,
-			platform, paymentMethod, receiptImageRef, now,
+			platform, paymentMethod, receiptImageRef, boolToInt(isFreebie), now,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("inserting purchase for %q: %w", item.Name, err)
@@ -295,11 +304,22 @@ func (inv *Inventory) recentOrders(ctx context.Context, limit int) ([]*OrderSumm
 // nullable returns a *float64 that's nil when the value is 0 — used
 // for INSERTing NULL into the DB instead of literal zero, which keeps
 // "we don't know the price" distinct from "the price is zero rupees."
+// (Freebies use is_freebie = 1 with price = 0, which IS stored, so
+// callers can tell "no price info" from "explicitly free".)
 func nullable(v float64) any {
 	if v == 0 {
 		return nil
 	}
 	return v
+}
+
+// boolToInt maps Go bool to the 0/1 integers SQLite expects for
+// columns declared BOOLEAN (SQLite has no native boolean type).
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // parsePurchaseDate accepts whatever Gemini extracted from the receipt

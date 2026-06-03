@@ -49,6 +49,12 @@ type ReceiptItem struct {
 	Price        float64 `json:"price"`
 	Category     string  `json:"category"`
 	TrackingType string  `json:"tracking_type"`
+	// IsFreebie marks items the receipt shows as FREE / complimentary
+	// / sample — typically with price 0 or strike-through pricing.
+	// Such items DO update inventory (we have them) but must be
+	// excluded from subscription detection, depletion forecasting,
+	// and cross-platform price comparison.
+	IsFreebie bool `json:"is_freebie"`
 }
 
 // ReceiptAgent wraps the Gemini client and exposes Scan().

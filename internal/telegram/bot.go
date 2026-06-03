@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -407,34 +408,152 @@ func (b *Bot) askNextAmbiguous(c tele.Context, order *PendingOrder) error {
 }
 
 // applyAmbiguousAnswer accepts the user's clarification for the
-// currently-asked ambiguous item. For MVP we just store the text in
-// the item name; future versions will parse "4 pieces" into qty+unit.
+// currently-asked ambiguous item. We try to parse a quantity + unit
+// out of common patterns ("4", "4 pieces", "2 dozen", "250g"); if
+// that succeeds AND the ambiguous item name matches an existing
+// scanned item, we UPDATE that item's quantity rather than creating
+// a new row. Otherwise we just log the clarification and skip —
+// never invent a new item from arbitrary free text. (A previous
+// version did, which polluted the DB with sentence-shaped item
+// names like "what can't you read in egg it's 2 dozen of eggs".)
+//
+// Phase 2 will replace this hand-rolled parser with a Gemini-backed
+// clarification agent that can handle full natural language.
 func (b *Bot) applyAmbiguousAnswer(c tele.Context, order *PendingOrder, answer string) error {
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
 		return c.Send("Couldn't parse that — try again, or tap Skip.")
 	}
 
-	b.sessions.Update(order.UserID, func(o *PendingOrder) {
-		// MVP: treat the user's reply as the corrected item name and
-		// add it as a new countable item with quantity 1. Full NLP
-		// parsing of "4 pieces of carrots" lands in Phase 2 alongside
-		// the usage-logging Gemini agent.
-		o.Items = append(o.Items, agents.ReceiptItem{
-			Name:         strings.ToLower(answer),
-			Quantity:     1,
-			Unit:         "pieces",
-			Category:     "other",
-			TrackingType: "countable",
+	ambigName := order.CurrentAmbiguous
+	qty, unit, parsed := parseQuantityReply(answer)
+
+	if parsed {
+		// Try to update the matching item already on the order. We
+		// match by case-insensitive substring on either side so that
+		// "robusta banana" matches the user saying "bananas" and
+		// vice versa.
+		updated := false
+		b.sessions.Update(order.UserID, func(o *PendingOrder) {
+			for i := range o.Items {
+				if itemMatches(o.Items[i].Name, ambigName) {
+					o.Items[i].Quantity = qty
+					if unit != "" {
+						o.Items[i].Unit = unit
+					}
+					updated = true
+					break
+				}
+			}
+			o.CurrentAmbiguous = ""
+			o.Stage = stageCollectingPhotos
 		})
+
+		if updated {
+			msg := fmt.Sprintf("✓ Got it: %s set to *%g %s*.", ambigName, qty, unit)
+			if err := c.Send(msg, tele.ModeMarkdown); err != nil {
+				return err
+			}
+			return b.advanceFlow(c)
+		}
+	}
+
+	// Couldn't confidently parse the reply into a structured update —
+	// log it for future eval data and acknowledge without creating
+	// junk items. The user can /cancel and re-upload if needed.
+	log.Printf("ambiguous-reply unparsed: item=%q reply=%q", ambigName, answer)
+
+	b.sessions.Update(order.UserID, func(o *PendingOrder) {
 		o.CurrentAmbiguous = ""
 		o.Stage = stageCollectingPhotos
 	})
 
-	if err := c.Send(fmt.Sprintf("✓ Got it: %q added to the order.", answer)); err != nil {
+	hint := fmt.Sprintf(
+		"Noted, but I couldn't structure your reply yet. For now I'll skip *%s*.\n"+
+			"_(Tip: try short replies like \"4\", \"4 pieces\", \"2 dozen\", or \"250g\". Full natural-language clarification arrives in Phase 2.)_",
+		ambigName,
+	)
+	if err := c.Send(hint, tele.ModeMarkdown); err != nil {
 		return err
 	}
 	return b.advanceFlow(c)
+}
+
+// parseQuantityReply pulls a quantity + optional unit out of short
+// replies people actually type. Returns parsed=false on anything
+// it can't confidently structure (sentences, free text).
+//
+// Accepted forms (case-insensitive, whitespace flexible):
+//
+//	"4"             -> 4, "pieces"
+//	"4 pieces"      -> 4, "pieces"
+//	"4 pcs"         -> 4, "pieces"
+//	"2 dozen"       -> 24, "pieces"
+//	"250g" / "250 gms" / "250 grams" -> 250, "g"
+//	"1.5 kg"        -> 1.5, "kg"
+//	"500 ml"        -> 500, "ml"
+//	"1 litre"       -> 1, "litres"
+//	"half a bottle" -> not parsed (free text, returns false)
+func parseQuantityReply(s string) (qty float64, unit string, ok bool) {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	// Strip common filler so "set to 4 pieces" still parses.
+	for _, p := range []string{"set to ", "make it ", "it's ", "its ", "actually ", "qty ", "quantity "} {
+		lower = strings.TrimPrefix(lower, p)
+	}
+
+	// Walk the first token: must start with a number.
+	var numStr string
+	for _, r := range lower {
+		if (r >= '0' && r <= '9') || r == '.' {
+			numStr += string(r)
+			continue
+		}
+		break
+	}
+	if numStr == "" {
+		return 0, "", false
+	}
+	n, err := strconv.ParseFloat(numStr, 64)
+	if err != nil || n <= 0 {
+		return 0, "", false
+	}
+
+	// Whatever's after the number tells us the unit.
+	rest := strings.TrimSpace(strings.TrimPrefix(lower, numStr))
+	switch {
+	case rest == "" || rest == "pcs" || rest == "pc" || rest == "piece" || rest == "pieces" || rest == "nos" || rest == "no":
+		return n, "pieces", true
+	case rest == "dozen" || rest == "dz":
+		return n * 12, "pieces", true
+	case strings.HasPrefix(rest, "kg") || strings.HasPrefix(rest, "kilo"):
+		return n, "kg", true
+	case rest == "g" || strings.HasPrefix(rest, "gm") || strings.HasPrefix(rest, "gram") || rest == "grm":
+		return n, "g", true
+	case strings.HasPrefix(rest, "ml") || strings.HasPrefix(rest, "milli"):
+		return n, "ml", true
+	case strings.HasPrefix(rest, "l") || strings.HasPrefix(rest, "lit"):
+		return n, "litres", true
+	case strings.HasPrefix(rest, "pack") || strings.HasPrefix(rest, "packet"):
+		return n, "packets", true
+	case strings.HasPrefix(rest, "bunch"):
+		return n, "bunch", true
+	}
+	// Number followed by free text we don't recognise — bail out so
+	// we don't guess wrong.
+	return 0, "", false
+}
+
+// itemMatches returns true if the item already on the order seems
+// to refer to the same product the ambiguous reply is about. We use
+// a loose substring match in either direction so plural/singular and
+// modifier words ("robusta banana" vs "banana") still align.
+func itemMatches(itemName, ambig string) bool {
+	a := strings.ToLower(strings.TrimSpace(itemName))
+	b := strings.ToLower(strings.TrimSpace(ambig))
+	if a == "" || b == "" {
+		return false
+	}
+	return strings.Contains(a, b) || strings.Contains(b, a)
 }
 
 // handleSkipAmbiguous — user tapped Skip on the current ambiguous item.
