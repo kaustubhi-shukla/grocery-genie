@@ -530,61 +530,32 @@ func (b *Bot) processReceiptInput(c tele.Context, file tele.File, mimeType strin
 	log.Printf("✓ scanned receipt: store=%q items=%d total=%.2f confidence=%.2f ambiguous=%d",
 		receipt.StoreName, len(receipt.Items), receipt.Total, receipt.Confidence, len(receipt.AmbiguousItems))
 
+	// MergeOrQueue is atomic — it acquires the session mutex once
+	// for "is this a bulk upload?" AND "apply the change", removing
+	// the race that let two concurrent uploads bypass the queue
+	// check and end up merged.
 	userID := c.Sender().ID
-	existing := b.sessions.Get(userID)
+	queued, snapshot := b.sessions.MergeOrQueue(userID, receipt, bulkUploadThreshold)
 
-	// BULK-UPLOAD DETECTION
-	// If there's already an active order with items AND this scan
-	// finished within bulkUploadThreshold of the previous scan, the
-	// user almost certainly dropped multiple files into chat at once
-	// (two separate receipts, not a multi-page receipt). Queue this
-	// one instead of merging — the user gets a separate payment
-	// confirmation for each. Multi-page receipts still work because
-	// the user reads the summary between photos, which takes longer
-	// than the threshold.
-	if existing != nil && len(existing.Items) > 0 &&
-		!existing.LastScanFinishedAt.IsZero() &&
-		time.Since(existing.LastScanFinishedAt) < bulkUploadThreshold {
-
-		b.sessions.Update(userID, func(o *PendingOrder) {
-			o.QueuedScans = append(o.QueuedScans, receipt)
-			o.LastScanFinishedAt = time.Now()
-		})
-		queueLen := len(existing.QueuedScans) + 1
+	if queued {
+		// Tell the user this one is parked; the current order still
+		// owns the chat UI (its Done button is what advances things).
 		notice := fmt.Sprintf(
 			"📥 *Got another receipt — queued (#%d in line)*\n\n"+
 				"Found %d items, Rs %.2f from %s.\n\n"+
 				"_I'll show this one after you finish saving the current order._",
-			queueLen, len(receipt.Items), receipt.Total,
+			len(snapshot.QueuedScans),
+			len(receipt.Items), receipt.Total,
 			displayStore(receipt.StoreName),
 		)
+		log.Printf("📥 queued receipt (#%d for user) — concurrent upload detected", len(snapshot.QueuedScans))
 		b.editOrSend(statusMsg, c, notice)
 		return nil
 	}
 
-	// MERGE / FRESH ORDER PATH
-	// Either no existing order, or enough time has passed since the
-	// last scan that this is genuinely a multi-page upload.
-	if existing == nil {
-		existing = b.sessions.Create(userID)
-	}
-	b.sessions.Update(userID, func(o *PendingOrder) {
-		o.Items = append(o.Items, receipt.Items...)
-		o.Total += receipt.Total
-		if o.Store == "" {
-			o.Store = receipt.StoreName
-		}
-		if o.Date == "" {
-			o.Date = receipt.Date
-		}
-		o.Ambiguous = append(o.Ambiguous, receipt.AmbiguousItems...)
-		o.LastScanFinishedAt = time.Now()
-	})
-
-	// First: replace the "Scanning…" message with the scan result.
+	// Merge path — replace the "Scanning…" message with the scan
+	// summary, then drive ambiguous Q&A or order summary.
 	b.editOrSend(statusMsg, c, formatScanSummary(receipt))
-
-	// Then: drive the next step (ambiguous Q&A or order summary).
 	return b.advanceFlow(c)
 }
 

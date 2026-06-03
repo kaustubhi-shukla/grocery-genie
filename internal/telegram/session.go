@@ -142,6 +142,64 @@ func (s *SessionStore) Delete(userID int64) {
 	delete(s.orders, userID)
 }
 
+// MergeOrQueue atomically applies a scanned receipt to the user's
+// session. With a single Lock held it decides between two paths:
+//
+//	MERGE — first scan, or enough time has passed since the previous
+//	        scan that this is a deliberate multi-page upload. The
+//	        receipt's items get appended into the existing order.
+//
+//	QUEUE — another scan finished less than `threshold` ago. This
+//	        almost certainly means the user dropped multiple files
+//	        in chat at once. We append the whole receipt to a queue
+//	        so it becomes a SEPARATE order after the current one is
+//	        saved/cancelled.
+//
+// Returns (queued, snapshot). When queued is true the caller should
+// tell the user "got it, you'll handle this one next" and NOT call
+// advanceFlow — the current order is still waiting on Done. When
+// queued is false the caller drives the normal scan-result UI.
+//
+// snapshot is a defensive shallow copy of the order at decision time,
+// safe to read without holding the lock.
+func (s *SessionStore) MergeOrQueue(userID int64, receipt *agents.Receipt, threshold time.Duration) (queued bool, snapshot PendingOrder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	o, ok := s.orders[userID]
+	if !ok || time.Since(o.UpdatedAt) > s.ttl {
+		o = &PendingOrder{
+			UserID: userID,
+			Stage:  stageCollectingPhotos,
+		}
+		s.orders[userID] = o
+	}
+
+	now := time.Now()
+	isBulk := len(o.Items) > 0 &&
+		!o.LastScanFinishedAt.IsZero() &&
+		now.Sub(o.LastScanFinishedAt) < threshold
+
+	if isBulk {
+		o.QueuedScans = append(o.QueuedScans, receipt)
+	} else {
+		o.Items = append(o.Items, receipt.Items...)
+		o.Total += receipt.Total
+		if o.Store == "" {
+			o.Store = receipt.StoreName
+		}
+		if o.Date == "" {
+			o.Date = receipt.Date
+		}
+		o.Ambiguous = append(o.Ambiguous, receipt.AmbiguousItems...)
+	}
+
+	o.LastScanFinishedAt = now
+	o.UpdatedAt = now
+
+	return isBulk, *o
+}
+
 // Close stops the background GC loop. Call from main() on shutdown.
 func (s *SessionStore) Close() {
 	close(s.stopChan)
