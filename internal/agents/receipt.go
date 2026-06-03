@@ -85,15 +85,24 @@ func NewReceiptAgent(ctx context.Context, apiKey string) (*ReceiptAgent, error) 
 
 	return &ReceiptAgent{
 		client: client,
-		// Gemini 3.1 Flash Lite: multimodal (text + image + PDF), 500
-		// requests/day on the free tier vs Gemini 2.5 Flash's 20.
-		// Slightly smaller model, but the receipt-scan task is a
-		// structured-extraction job (not open-ended reasoning) so the
-		// quality gap is minor and the 25× higher daily ceiling is
-		// the right trade for our bulk-upload workflow. If accuracy
-		// ever proves insufficient we can ladder back up to
-		// gemini-2.5-flash on parse failures.
-		model: "gemini-3.1-flash-lite",
+		// Gemini 2.5 Flash: best accuracy on Indian receipts in the
+		// free tier. Confidence ~0.95 with very few ambiguous_items
+		// on the same FirstClub PDFs that Lite flagged 4-5 items on.
+		//
+		// Trade-off: only 20 requests/day free. Bulk historical
+		// uploads need to be spread over multiple days OR billing
+		// must be enabled. Daily ongoing usage (a few scans per
+		// day) fits comfortably under 20 RPD with margin.
+		//
+		// ErrQuotaExhausted handling in the Telegram layer tells the
+		// user clearly when the daily cap is hit so they're never
+		// confused about why a scan failed.
+		//
+		// A smarter long-term answer is to ladder: try Flash Lite
+		// (500 RPD) first, escalate to 2.5 Flash on low confidence
+		// or high ambiguous count. We'll build that in Phase 2 once
+		// we have eval data to tune the escalation threshold.
+		model: "gemini-2.5-flash",
 	}, nil
 }
 
