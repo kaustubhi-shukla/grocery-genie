@@ -96,7 +96,6 @@ func (b *Bot) registerHandlers() {
 	// Commands
 	b.bot.Handle("/start", b.handleStart)
 	b.bot.Handle("/help", b.handleHelp)
-	b.bot.Handle("/stock", b.handleStockComingSoon)
 	b.bot.Handle("/cancel", b.handleCancelCommand)
 	b.bot.Handle("/lastorder", b.handleLastOrder)
 	b.bot.Handle("/recent", b.handleRecent)
@@ -105,6 +104,10 @@ func (b *Bot) registerHandlers() {
 	b.bot.Handle("/setqty", b.handleSetQuantity)
 	b.bot.Handle("/setprice", b.handleSetPrice)
 	b.bot.Handle("/delpurchase", b.handleDeletePurchase)
+	b.bot.Handle("/stock", b.handleStockReport)
+	b.bot.Handle("/spend", b.handleSpend)
+	b.bot.Handle("/compare", b.handleCompare)
+	b.bot.Handle("/audit", b.handleAudit)
 
 	// Content types
 	b.bot.Handle(tele.OnText, b.handleText)
@@ -176,15 +179,21 @@ func (b *Bot) handleHelp(c tele.Context) error {
 ✅ Confirm payment method with a tap
 ✅ Save your order to inventory
 
-*Commands:*
-/lastorder — show the most recent saved order (verify payment, items)
-/recent — show the last 5 saved orders
-/find <name> — search purchases by item name (returns IDs)
-/freebie <id> — mark a purchase as a freebie
+*Reading commands:*
+/stock — current inventory, grouped + flagged
+/spend — spend breakdown by platform / payment / category
+/compare <item> — price comparison across platforms
+/lastorder — most recent saved order
+/recent — last 5 saved orders
+/find <name> — search purchases by name (returns IDs)
+
+*Editing commands:*
+/freebie <id> — mark a purchase as freebie
 /setqty <id> <num> — fix a purchase's quantity
 /setprice <id> <amount> — fix a purchase's price
-/delpurchase <id> — delete a purchase entirely
+/delpurchase <id> — delete a purchase
 /cancel — abort the in-progress order
+
 /help — this message
 
 *Tips:*
@@ -199,9 +208,8 @@ func (b *Bot) handleHelp(c tele.Context) error {
 • Monthly budget dashboard (Phase 5)`, tele.ModeMarkdown)
 }
 
-func (b *Bot) handleStockComingSoon(c tele.Context) error {
-	return c.Send("Stock queries arrive in Phase 2. Hang tight!")
-}
+// (the old "coming soon" /stock stub used to live here — handleStockReport
+//  below replaces it. Phase 1.5 promotion.)
 
 // handleLastOrder shows the most recently saved order so the user
 // can verify what made it into the database (items, payment, total).
@@ -244,6 +252,89 @@ func (b *Bot) handleRecent(c tele.Context) error {
 			o.PurchasedAt.Format("Jan 2, 15:04"), o.ItemCount, o.TotalRupees))
 	}
 	return c.Send(sb.String(), tele.ModeMarkdown)
+}
+
+// handleAudit runs pattern heuristics over the existing purchases
+// to surface rows that LOOK like freebies hidden under a list price.
+// Never auto-marks — every flagged row carries the reason so the
+// user can /freebie <id> the ones they agree with.
+func (b *Bot) handleAudit(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	candidates, err := b.inventory.FreebieAudit(ctx)
+	if err != nil {
+		log.Printf("/audit: %v", err)
+		return c.Send("Couldn't run the audit right now — try again in a moment.")
+	}
+	if len(candidates) == 0 {
+		return c.Send("✅ No suspicious rows found. Everything in the DB looks like a legitimate paid purchase.")
+	}
+	return c.Send(formatAudit(candidates), tele.ModeMarkdown)
+}
+
+// handleStockReport — Phase 1.5 promotion of /stock from "coming
+// soon" to a real read-only inventory dashboard. Groups items by
+// category and flags REORDER / LOW with emojis so the user can
+// scan a long list quickly.
+func (b *Bot) handleStockReport(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	entries, err := b.inventory.CurrentStock(ctx)
+	if err != nil {
+		log.Printf("/stock: %v", err)
+		return c.Send("Couldn't load your stock right now — try again in a moment.")
+	}
+	if len(entries) == 0 {
+		return c.Send("Your inventory is empty. Send a receipt photo to start logging items.")
+	}
+	return c.Send(formatStock(entries), tele.ModeMarkdown)
+}
+
+// handleSpend — Phase 1.5 promotion of the Phase 5 budget dashboard
+// to a working command using the data we already have. Shows total
+// spend, breakdowns by platform/payment/category, and a side note
+// on freebie value if any have been marked.
+func (b *Bot) handleSpend(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	b2, err := b.inventory.SpendSummary(ctx)
+	if err != nil {
+		log.Printf("/spend: %v", err)
+		return c.Send("Couldn't compute your spend right now — try again in a moment.")
+	}
+	if b2.TotalPurchases == 0 {
+		return c.Send("No paid purchases logged yet. Send a receipt photo to start.")
+	}
+	return c.Send(formatSpend(b2), tele.ModeMarkdown)
+}
+
+// handleCompare — Phase 1.5 preview of Phase 3 cross-platform price
+// comparison. Takes an item name query, finds matching items the
+// user has bought from multiple platforms, and ranks platforms by
+// average price-per-unit.
+func (b *Bot) handleCompare(c tele.Context) error {
+	query := strings.TrimSpace(c.Message().Payload)
+	if query == "" {
+		return c.Send("Usage: `/compare <item name>` — e.g., `/compare carrot` or `/compare milk`", tele.ModeMarkdown)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	comparisons, err := b.inventory.CompareItem(ctx, query)
+	if err != nil {
+		log.Printf("/compare: %v", err)
+		return c.Send("Couldn't compare prices right now — try again in a moment.")
+	}
+	if len(comparisons) == 0 {
+		return c.Send(fmt.Sprintf(
+			"No paid purchases found for items matching %q. Either you haven't bought it yet, or all purchases of it were freebies.",
+			query,
+		))
+	}
+	return c.Send(formatCompare(comparisons), tele.ModeMarkdown)
 }
 
 // handleFind searches purchases by item name and lists purchase IDs
@@ -1115,6 +1206,147 @@ func formatItemLine(it agents.ReceiptItem) string {
 		line += fmt.Sprintf(" _(%s)_", it.TrackingType)
 	}
 	return line + "\n"
+}
+
+func formatAudit(candidates []tools.FreebieCandidate) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🔍 *Freebie audit* — %d candidate(s) for your review\n\n", len(candidates)))
+
+	// Group by reason so the user understands what pattern matched.
+	byReason := map[string][]tools.FreebieCandidate{}
+	order := []string{}
+	for _, c := range candidates {
+		if _, seen := byReason[c.Reason]; !seen {
+			order = append(order, c.Reason)
+		}
+		byReason[c.Reason] = append(byReason[c.Reason], c)
+	}
+
+	for _, reason := range order {
+		sb.WriteString(fmt.Sprintf("*Reason:* _%s_\n", reason))
+		for _, c := range byReason[reason] {
+			priceLabel := "no price"
+			if c.Price > 0 {
+				priceLabel = fmt.Sprintf("Rs %.0f", c.Price)
+			}
+			sb.WriteString(fmt.Sprintf("  `#%d` · %s · %g %s · %s · _%s_\n",
+				c.PurchaseID, c.ItemName, c.Quantity, c.Unit, priceLabel, c.Platform))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("_Mark the ones you agree with: `/freebie <id>`._")
+	return sb.String()
+}
+
+func formatStock(entries []tools.StockEntry) string {
+	var sb strings.Builder
+	sb.WriteString("🧺 *Current stock*\n\n")
+
+	// Group by category for readability.
+	current := ""
+	reorder, low, ok := 0, 0, 0
+	for _, e := range entries {
+		if e.Category != current {
+			if current != "" {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(fmt.Sprintf("*%s*\n", strings.Title(e.Category)))
+			current = e.Category
+		}
+		var icon string
+		switch e.Status {
+		case tools.StatusReorderNow:
+			icon = "🔴"
+			reorder++
+		case tools.StatusLow:
+			icon = "🟡"
+			low++
+		default:
+			icon = "🟢"
+			ok++
+		}
+		// Estimated items don't really have a stock level — show a
+		// gentler line.
+		if e.TrackingType == "estimated" {
+			sb.WriteString(fmt.Sprintf("%s %s _(estimated — tracked by purchase cycle)_\n", icon, e.ItemName))
+		} else {
+			sb.WriteString(fmt.Sprintf("%s %s — %g %s\n", icon, e.ItemName, e.Quantity, e.Unit))
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("\n_Summary: 🔴 %d reorder · 🟡 %d low · 🟢 %d ok_", reorder, low, ok))
+	return sb.String()
+}
+
+func formatSpend(b *tools.SpendBreakdown) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("💰 *Spend tracked* — Rs %.2f across %d purchases\n", b.TotalSpend, b.TotalPurchases))
+
+	if b.FreebieCount > 0 {
+		sb.WriteString(fmt.Sprintf("_(+ %d freebie items worth Rs %.2f at list price — not counted toward spend)_\n", b.FreebieCount, b.FreebieListPrice))
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("*By platform:*\n")
+	for _, g := range b.ByPlatform {
+		sb.WriteString(fmt.Sprintf("  • %s — Rs %.0f _(%d items)_\n", g.Label, g.SpendRupee, g.ItemCount))
+	}
+
+	sb.WriteString("\n*By payment method:*\n")
+	for _, g := range b.ByPaymentMethod {
+		sb.WriteString(fmt.Sprintf("  • %s — Rs %.0f _(%d items)_\n", g.Label, g.SpendRupee, g.ItemCount))
+	}
+
+	sb.WriteString("\n*By category:*\n")
+	for _, g := range b.ByCategory {
+		sb.WriteString(fmt.Sprintf("  • %s — Rs %.0f _(%d items)_\n", g.Label, g.SpendRupee, g.ItemCount))
+	}
+
+	return sb.String()
+}
+
+func formatCompare(comparisons []tools.ItemPriceComparison) string {
+	var sb strings.Builder
+	for i, c := range comparisons {
+		if i > 0 {
+			sb.WriteString("\n────────\n")
+		}
+		sb.WriteString(fmt.Sprintf("📊 *%s* — price by platform\n\n", c.ItemName))
+		if len(c.Platforms) < 2 {
+			if len(c.Platforms) == 1 {
+				p := c.Platforms[0]
+				sb.WriteString(fmt.Sprintf(
+					"Only bought from one platform so far:\n  • *%s*: Rs %.2f / %s avg _(%d purchases)_\n",
+					p.Platform, p.AvgPricePerUnit, p.Unit, p.PurchaseCount,
+				))
+				sb.WriteString("\n_Buy from a second platform and I can compare._")
+			}
+			continue
+		}
+		cheapest := c.Platforms[0]
+		mostExpensive := c.Platforms[len(c.Platforms)-1]
+		for rank, p := range c.Platforms {
+			marker := "  "
+			if rank == 0 {
+				marker = "🥇"
+			} else if rank == len(c.Platforms)-1 && p.AvgPricePerUnit > cheapest.AvgPricePerUnit*1.001 {
+				marker = "💸"
+			}
+			sb.WriteString(fmt.Sprintf(
+				"%s *%s* — Rs %.2f / %s avg _(min Rs %.2f · max Rs %.2f · %d purchases)_\n",
+				marker, p.Platform, p.AvgPricePerUnit, p.Unit,
+				p.MinPricePerUnit, p.MaxPricePerUnit, p.PurchaseCount,
+			))
+		}
+		if mostExpensive.AvgPricePerUnit > cheapest.AvgPricePerUnit {
+			diff := (mostExpensive.AvgPricePerUnit - cheapest.AvgPricePerUnit) / cheapest.AvgPricePerUnit * 100
+			sb.WriteString(fmt.Sprintf(
+				"\n_%s is %.0f%% cheaper than %s for this item._",
+				cheapest.Platform, diff, mostExpensive.Platform,
+			))
+		}
+	}
+	return sb.String()
 }
 
 func formatSaveSuccess(store, paymentMethod string, saved []tools.SavedPurchase) string {
