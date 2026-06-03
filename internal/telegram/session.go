@@ -54,6 +54,19 @@ type PendingOrder struct {
 	// showing the payment buttons, so we can edit it in place.
 	PaymentBtnMsgID int
 
+	// QueuedScans holds full receipts that arrived while this order
+	// was still open AND too close in time to be a multi-page upload.
+	// When the current order is saved (or cancelled), we pop the
+	// next queued scan and start a fresh order with it. Lets a user
+	// drop several PDFs into chat at once and walk through them
+	// sequentially without losing any.
+	QueuedScans []*agents.Receipt
+
+	// LastScanFinishedAt is the wall-clock time the last scan for
+	// this order completed. Bulk-upload detection compares against
+	// this to decide merge-vs-queue.
+	LastScanFinishedAt time.Time
+
 	UpdatedAt time.Time
 }
 

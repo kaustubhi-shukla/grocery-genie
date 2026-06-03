@@ -530,11 +530,43 @@ func (b *Bot) processReceiptInput(c tele.Context, file tele.File, mimeType strin
 	log.Printf("✓ scanned receipt: store=%q items=%d total=%.2f confidence=%.2f ambiguous=%d",
 		receipt.StoreName, len(receipt.Items), receipt.Total, receipt.Confidence, len(receipt.AmbiguousItems))
 
-	// Append to any existing pending order, or start a new one.
 	userID := c.Sender().ID
-	order := b.sessions.Get(userID)
-	if order == nil {
-		order = b.sessions.Create(userID)
+	existing := b.sessions.Get(userID)
+
+	// BULK-UPLOAD DETECTION
+	// If there's already an active order with items AND this scan
+	// finished within bulkUploadThreshold of the previous scan, the
+	// user almost certainly dropped multiple files into chat at once
+	// (two separate receipts, not a multi-page receipt). Queue this
+	// one instead of merging — the user gets a separate payment
+	// confirmation for each. Multi-page receipts still work because
+	// the user reads the summary between photos, which takes longer
+	// than the threshold.
+	if existing != nil && len(existing.Items) > 0 &&
+		!existing.LastScanFinishedAt.IsZero() &&
+		time.Since(existing.LastScanFinishedAt) < bulkUploadThreshold {
+
+		b.sessions.Update(userID, func(o *PendingOrder) {
+			o.QueuedScans = append(o.QueuedScans, receipt)
+			o.LastScanFinishedAt = time.Now()
+		})
+		queueLen := len(existing.QueuedScans) + 1
+		notice := fmt.Sprintf(
+			"📥 *Got another receipt — queued (#%d in line)*\n\n"+
+				"Found %d items, Rs %.2f from %s.\n\n"+
+				"_I'll show this one after you finish saving the current order._",
+			queueLen, len(receipt.Items), receipt.Total,
+			displayStore(receipt.StoreName),
+		)
+		b.editOrSend(statusMsg, c, notice)
+		return nil
+	}
+
+	// MERGE / FRESH ORDER PATH
+	// Either no existing order, or enough time has passed since the
+	// last scan that this is genuinely a multi-page upload.
+	if existing == nil {
+		existing = b.sessions.Create(userID)
 	}
 	b.sessions.Update(userID, func(o *PendingOrder) {
 		o.Items = append(o.Items, receipt.Items...)
@@ -546,6 +578,7 @@ func (b *Bot) processReceiptInput(c tele.Context, file tele.File, mimeType strin
 			o.Date = receipt.Date
 		}
 		o.Ambiguous = append(o.Ambiguous, receipt.AmbiguousItems...)
+		o.LastScanFinishedAt = time.Now()
 	})
 
 	// First: replace the "Scanning…" message with the scan result.
@@ -553,6 +586,21 @@ func (b *Bot) processReceiptInput(c tele.Context, file tele.File, mimeType strin
 
 	// Then: drive the next step (ambiguous Q&A or order summary).
 	return b.advanceFlow(c)
+}
+
+// bulkUploadThreshold is the gap below which a second scan is
+// considered a "concurrent upload" rather than a "multi-page receipt".
+// Picked to be longer than Telegram delivery + scan latency but
+// shorter than a human's review time.
+const bulkUploadThreshold = 15 * time.Second
+
+// displayStore returns a non-empty store label for messages — falls
+// back to "an unknown store" so messages read naturally.
+func displayStore(s string) string {
+	if s == "" {
+		return "an unknown store"
+	}
+	return s
 }
 
 // advanceFlow decides what to send next based on session state.
@@ -776,7 +824,13 @@ func (b *Bot) handleAddMore(c tele.Context) error {
 		b.neutraliseStaleButtons(c)
 		return c.Send("That order is already finished. Send a fresh receipt to start a new one.")
 	}
-	return c.Send("📸 Sure — send the next photo/PDF whenever you're ready.")
+	// User EXPLICITLY wants the next upload merged into this order.
+	// Reset the last-scan timestamp so the bulk-upload heuristic
+	// doesn't queue it.
+	b.sessions.Update(c.Sender().ID, func(o *PendingOrder) {
+		o.LastScanFinishedAt = time.Time{}
+	})
+	return c.Send("📸 Sure — send the next photo/PDF whenever you're ready (I'll merge it into this order).")
 }
 
 func (b *Bot) handleCancelOrder(c tele.Context) error {
@@ -788,10 +842,14 @@ func (b *Bot) handleCancelOrder(c tele.Context) error {
 		b.neutraliseStaleButtons(c)
 		return nil
 	}
+	// Preserve any queued scans — the user only cancelled THIS order,
+	// not the bulk-upload batch they may have started.
+	queued := append([]*agents.Receipt(nil), order.QueuedScans...)
 	b.sessions.Delete(order.UserID)
 	if c.Message() != nil {
 		_, _ = b.bot.Edit(c.Message(), "❌ Order cancelled. Nothing saved.")
 	}
+	b.promoteNextQueuedScan(c, queued)
 	return nil
 }
 
@@ -889,6 +947,10 @@ func (b *Bot) makePaymentHandler(method string) tele.HandlerFunc {
 			return nil
 		}
 
+		// Capture the queue BEFORE we delete the session — those
+		// receipts arrived while this order was open and need to be
+		// handled next.
+		queued := append([]*agents.Receipt(nil), order.QueuedScans...)
 		b.sessions.Delete(order.UserID)
 
 		// Mark today as "logged" — keeps the 8 PM nudge from firing.
@@ -902,9 +964,52 @@ func (b *Bot) makePaymentHandler(method string) tele.HandlerFunc {
 		summary := formatSaveSuccess(order.Store, method, saved)
 		if c.Message() != nil {
 			_, err = b.bot.Edit(c.Message(), summary, tele.ModeMarkdown)
-			return err
+		} else {
+			err = c.Send(summary, tele.ModeMarkdown)
 		}
-		return c.Send(summary, tele.ModeMarkdown)
+		if err != nil {
+			log.Printf("send success summary: %v", err)
+		}
+
+		// If more receipts are queued, immediately start the next
+		// order so the user can keep moving.
+		b.promoteNextQueuedScan(c, queued)
+		return nil
+	}
+}
+
+// promoteNextQueuedScan pops the first receipt off a queue and uses
+// it to start a fresh PendingOrder. Any remaining queued receipts
+// carry forward into the new session. Called after Done-save and
+// after Cancel.
+func (b *Bot) promoteNextQueuedScan(c tele.Context, queued []*agents.Receipt) {
+	if len(queued) == 0 {
+		return
+	}
+	userID := c.Sender().ID
+	next := queued[0]
+	remaining := queued[1:]
+
+	newOrder := b.sessions.Create(userID)
+	b.sessions.Update(userID, func(o *PendingOrder) {
+		o.Items = append(o.Items, next.Items...)
+		o.Total = next.Total
+		o.Store = next.StoreName
+		o.Date = next.Date
+		o.Ambiguous = append(o.Ambiguous, next.AmbiguousItems...)
+		o.LastScanFinishedAt = time.Now()
+		for _, r := range remaining {
+			o.QueuedScans = append(o.QueuedScans, r)
+		}
+	})
+	_ = newOrder // sessions.Create already wrote it; this just silences unused-var lint
+
+	announce := fmt.Sprintf("▶️ *Next queued receipt — %s*", displayStore(next.StoreName))
+	if err := c.Send(announce, tele.ModeMarkdown); err != nil {
+		log.Printf("announce next queued: %v", err)
+	}
+	if err := b.advanceFlow(c); err != nil {
+		log.Printf("advance after queue promotion: %v", err)
 	}
 }
 
