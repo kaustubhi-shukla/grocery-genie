@@ -82,13 +82,6 @@ func (inv *Inventory) SaveConfirmedOrder(
 			return nil, fmt.Errorf("resolving item %q: %w", item.Name, err)
 		}
 
-		// 2) Insert the purchase row. price_per_unit is computed for
-		//    cross-platform comparison later (Phase 3 feature).
-		var pricePerUnit *float64
-		if item.Price > 0 && item.Quantity > 0 {
-			ppu := item.Price / item.Quantity
-			pricePerUnit = &ppu
-		}
 		// Mark items as freebies when EITHER Gemini explicitly flagged
 		// them (FREE / complimentary markers on the receipt) OR price
 		// was 0 (paid-for items always have a positive price). Either
@@ -98,6 +91,17 @@ func (inv *Inventory) SaveConfirmedOrder(
 		// but must be excluded from subscription, depletion, and
 		// price-per-unit math.
 		isFreebie := item.IsFreebie || item.Price == 0
+
+		// Compute price_per_unit only for PAID purchases. For
+		// freebies we keep the list price in `price` (so /spend can
+		// tally "value of free items received") but null out the
+		// per-unit so /compare doesn't average a freebie's list
+		// price into a platform's effective cost.
+		var pricePerUnit *float64
+		if !isFreebie && item.Price > 0 && item.Quantity > 0 {
+			ppu := item.Price / item.Quantity
+			pricePerUnit = &ppu
+		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO purchases (
 				item_id, quantity, price, price_per_unit,

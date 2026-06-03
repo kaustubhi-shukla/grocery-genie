@@ -68,13 +68,19 @@ func (inv *Inventory) FindPurchases(ctx context.Context, query string, limit int
 	return results, rows.Err()
 }
 
-// MarkAsFreebie flips a purchase to is_freebie=1, clears price and
-// price_per_unit so price math ignores it. Inventory is unchanged —
-// the household still has the item, we just don't pretend they paid.
+// MarkAsFreebie flips a purchase to is_freebie=1. The `price` column
+// is RETAINED as the item's list price (so /spend can tally "value
+// of free items received"), but `price_per_unit` is cleared so the
+// /compare price-comparison reports never average in a zero-cost
+// "buy". The is_freebie flag is the single source of truth for "do
+// not count this row in replenishment / spend math".
+//
+// Inventory is unchanged — the household still has the item, we
+// just don't pretend they paid for it.
 func (inv *Inventory) MarkAsFreebie(ctx context.Context, purchaseID int64) (*PurchaseMatch, error) {
 	res, err := inv.db.ExecContext(ctx, `
 		UPDATE purchases
-		   SET is_freebie = 1, price = NULL, price_per_unit = NULL
+		   SET is_freebie = 1, price_per_unit = NULL
 		 WHERE id = ?
 	`, purchaseID)
 	if err != nil {

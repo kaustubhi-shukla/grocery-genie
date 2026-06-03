@@ -107,6 +107,7 @@ func (b *Bot) registerHandlers() {
 	b.bot.Handle("/stock", b.handleStockReport)
 	b.bot.Handle("/spend", b.handleSpend)
 	b.bot.Handle("/compare", b.handleCompare)
+	b.bot.Handle("/audit", b.handleAudit)
 
 	// Content types
 	b.bot.Handle(tele.OnText, b.handleText)
@@ -251,6 +252,25 @@ func (b *Bot) handleRecent(c tele.Context) error {
 			o.PurchasedAt.Format("Jan 2, 15:04"), o.ItemCount, o.TotalRupees))
 	}
 	return c.Send(sb.String(), tele.ModeMarkdown)
+}
+
+// handleAudit runs pattern heuristics over the existing purchases
+// to surface rows that LOOK like freebies hidden under a list price.
+// Never auto-marks — every flagged row carries the reason so the
+// user can /freebie <id> the ones they agree with.
+func (b *Bot) handleAudit(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	candidates, err := b.inventory.FreebieAudit(ctx)
+	if err != nil {
+		log.Printf("/audit: %v", err)
+		return c.Send("Couldn't run the audit right now — try again in a moment.")
+	}
+	if len(candidates) == 0 {
+		return c.Send("✅ No suspicious rows found. Everything in the DB looks like a legitimate paid purchase.")
+	}
+	return c.Send(formatAudit(candidates), tele.ModeMarkdown)
 }
 
 // handleStockReport — Phase 1.5 promotion of /stock from "coming
@@ -1186,6 +1206,36 @@ func formatItemLine(it agents.ReceiptItem) string {
 		line += fmt.Sprintf(" _(%s)_", it.TrackingType)
 	}
 	return line + "\n"
+}
+
+func formatAudit(candidates []tools.FreebieCandidate) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🔍 *Freebie audit* — %d candidate(s) for your review\n\n", len(candidates)))
+
+	// Group by reason so the user understands what pattern matched.
+	byReason := map[string][]tools.FreebieCandidate{}
+	order := []string{}
+	for _, c := range candidates {
+		if _, seen := byReason[c.Reason]; !seen {
+			order = append(order, c.Reason)
+		}
+		byReason[c.Reason] = append(byReason[c.Reason], c)
+	}
+
+	for _, reason := range order {
+		sb.WriteString(fmt.Sprintf("*Reason:* _%s_\n", reason))
+		for _, c := range byReason[reason] {
+			priceLabel := "no price"
+			if c.Price > 0 {
+				priceLabel = fmt.Sprintf("Rs %.0f", c.Price)
+			}
+			sb.WriteString(fmt.Sprintf("  `#%d` · %s · %g %s · %s · _%s_\n",
+				c.PurchaseID, c.ItemName, c.Quantity, c.Unit, priceLabel, c.Platform))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("_Mark the ones you agree with: `/freebie <id>`._")
+	return sb.String()
 }
 
 func formatStock(entries []tools.StockEntry) string {
