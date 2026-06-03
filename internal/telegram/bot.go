@@ -100,6 +100,11 @@ func (b *Bot) registerHandlers() {
 	b.bot.Handle("/cancel", b.handleCancelCommand)
 	b.bot.Handle("/lastorder", b.handleLastOrder)
 	b.bot.Handle("/recent", b.handleRecent)
+	b.bot.Handle("/find", b.handleFind)
+	b.bot.Handle("/freebie", b.handleMarkFreebie)
+	b.bot.Handle("/setqty", b.handleSetQuantity)
+	b.bot.Handle("/setprice", b.handleSetPrice)
+	b.bot.Handle("/delpurchase", b.handleDeletePurchase)
 
 	// Content types
 	b.bot.Handle(tele.OnText, b.handleText)
@@ -174,6 +179,11 @@ func (b *Bot) handleHelp(c tele.Context) error {
 *Commands:*
 /lastorder — show the most recent saved order (verify payment, items)
 /recent — show the last 5 saved orders
+/find <name> — search purchases by item name (returns IDs)
+/freebie <id> — mark a purchase as a freebie
+/setqty <id> <num> — fix a purchase's quantity
+/setprice <id> <amount> — fix a purchase's price
+/delpurchase <id> — delete a purchase entirely
 /cancel — abort the in-progress order
 /help — this message
 
@@ -234,6 +244,175 @@ func (b *Bot) handleRecent(c tele.Context) error {
 			o.PurchasedAt.Format("Jan 2, 15:04"), o.ItemCount, o.TotalRupees))
 	}
 	return c.Send(sb.String(), tele.ModeMarkdown)
+}
+
+// handleFind searches purchases by item name and lists purchase IDs
+// the user can pass to the edit commands.
+//
+// Usage: /find banana
+func (b *Bot) handleFind(c tele.Context) error {
+	query := strings.TrimSpace(c.Message().Payload)
+	if query == "" {
+		return c.Send("Usage: `/find <item name>` — e.g., `/find banana`", tele.ModeMarkdown)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	matches, err := b.inventory.FindPurchases(ctx, query, 10)
+	if err != nil {
+		log.Printf("/find: %v", err)
+		return c.Send("Couldn't search right now — try again in a moment.")
+	}
+	if len(matches) == 0 {
+		return c.Send(fmt.Sprintf("No purchases matched %q. Try a shorter or different keyword.", query))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("*Found %d purchase(s) for %q:*\n\n", len(matches), query))
+	for _, m := range matches {
+		sb.WriteString(fmt.Sprintf("`#%d` · %s · %g %s",
+			m.PurchaseID, m.ItemName, m.Quantity, m.Unit))
+		if m.IsFreebie {
+			sb.WriteString(" · _freebie_")
+		} else if m.HasPrice {
+			sb.WriteString(fmt.Sprintf(" · Rs %.0f", m.Price))
+		}
+		sb.WriteString(fmt.Sprintf(" · _%s/%s_\n", m.Platform, m.PaymentMethod))
+	}
+	sb.WriteString("\nEdit commands:\n")
+	sb.WriteString("`/freebie <id>` · `/setqty <id> <number>` · `/setprice <id> <amount>` · `/delpurchase <id>`")
+	return c.Send(sb.String(), tele.ModeMarkdown)
+}
+
+// handleMarkFreebie marks a purchase as a freebie.
+//
+// Usage: /freebie 119
+func (b *Bot) handleMarkFreebie(c tele.Context) error {
+	id, ok := parsePurchaseID(c.Message().Payload)
+	if !ok {
+		return c.Send("Usage: `/freebie <purchase_id>` — e.g., `/freebie 119`\n_(Find IDs with `/find <item name>`.)_", tele.ModeMarkdown)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	after, err := b.inventory.MarkAsFreebie(ctx, id)
+	if err != nil {
+		return b.sendEditError(c, err, id)
+	}
+	return c.Send(fmt.Sprintf(
+		"✅ Marked as freebie:\n`#%d` · %s · %g %s · _%s_\n\n_Won't count for replenishment forecasting._",
+		after.PurchaseID, after.ItemName, after.Quantity, after.Unit, after.Platform,
+	), tele.ModeMarkdown)
+}
+
+// handleSetQuantity updates a purchase's quantity and adjusts inventory.
+//
+// Usage: /setqty 161 4
+func (b *Bot) handleSetQuantity(c tele.Context) error {
+	id, qty, ok := parseIDAndNumber(c.Message().Payload)
+	if !ok {
+		return c.Send("Usage: `/setqty <purchase_id> <number>` — e.g., `/setqty 161 4`", tele.ModeMarkdown)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	after, err := b.inventory.SetPurchaseQuantity(ctx, id, qty)
+	if err != nil {
+		return b.sendEditError(c, err, id)
+	}
+	return c.Send(fmt.Sprintf(
+		"✅ Updated quantity:\n`#%d` · %s · *%g %s*\n_Inventory adjusted._",
+		after.PurchaseID, after.ItemName, after.Quantity, after.Unit,
+	), tele.ModeMarkdown)
+}
+
+// handleSetPrice updates a purchase's price.
+//
+// Usage: /setprice 119 35
+func (b *Bot) handleSetPrice(c tele.Context) error {
+	id, price, ok := parseIDAndNumber(c.Message().Payload)
+	if !ok {
+		return c.Send("Usage: `/setprice <purchase_id> <amount>` — e.g., `/setprice 119 35`", tele.ModeMarkdown)
+	}
+	if price < 0 {
+		return c.Send("Price can't be negative.")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	after, err := b.inventory.SetPurchasePrice(ctx, id, price)
+	if err != nil {
+		return b.sendEditError(c, err, id)
+	}
+	suffix := ""
+	if after.IsFreebie {
+		suffix = "\n_Auto-marked as freebie since price was set to 0._"
+	}
+	return c.Send(fmt.Sprintf(
+		"✅ Updated price:\n`#%d` · %s · *Rs %.2f*%s",
+		after.PurchaseID, after.ItemName, after.Price, suffix,
+	), tele.ModeMarkdown)
+}
+
+// handleDeletePurchase removes a purchase entirely.
+//
+// Usage: /delpurchase 38
+func (b *Bot) handleDeletePurchase(c tele.Context) error {
+	id, ok := parsePurchaseID(c.Message().Payload)
+	if !ok {
+		return c.Send("Usage: `/delpurchase <purchase_id>` — e.g., `/delpurchase 38`", tele.ModeMarkdown)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	deleted, err := b.inventory.DeletePurchase(ctx, id)
+	if err != nil {
+		return b.sendEditError(c, err, id)
+	}
+	return c.Send(fmt.Sprintf(
+		"🗑 Deleted purchase:\n`#%d` · %s · %g %s · _%s_\n_Inventory adjusted (countable items only)._",
+		deleted.PurchaseID, deleted.ItemName, deleted.Quantity, deleted.Unit, deleted.Platform,
+	), tele.ModeMarkdown)
+}
+
+// sendEditError centralises the not-found / generic-error reply for
+// the edit commands.
+func (b *Bot) sendEditError(c tele.Context, err error, id int64) error {
+	if errors.Is(err, tools.ErrPurchaseNotFound) {
+		return c.Send(fmt.Sprintf("No purchase with id `%d`. Use `/find <item>` to look up IDs.", id), tele.ModeMarkdown)
+	}
+	log.Printf("edit failed for purchase %d: %v", id, err)
+	return c.Send(fmt.Sprintf("Couldn't update purchase %d — %v", id, err))
+}
+
+// parsePurchaseID parses a payload like "119" or " 119 " into an int64.
+func parsePurchaseID(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseIDAndNumber parses "119 4" or "119 35.5" into (id, value).
+func parseIDAndNumber(s string) (int64, float64, bool) {
+	parts := strings.Fields(s)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	id, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || id <= 0 {
+		return 0, 0, false
+	}
+	v, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return id, v, true
 }
 
 // formatOrderSummaryFromDB renders a saved order for /lastorder.
