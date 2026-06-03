@@ -29,6 +29,12 @@ import (
 // message rather than blame the image.
 var ErrTransient = errors.New("transient AI service error")
 
+// ErrQuotaExhausted is returned when we hit Gemini's per-day request
+// limit (free-tier RPD). Retrying within the same day is hopeless —
+// the caller should tell the user the limit was hit, suggest waiting
+// for the daily quota reset, and skip the retry loop entirely.
+var ErrQuotaExhausted = errors.New("gemini daily quota exhausted")
+
 // Receipt is the structured output of scanning a receipt image.
 // The JSON tags match the schema in prompts/receipt_scan.txt; Gemini
 // returns JSON in that shape, which we decode into this struct.
@@ -79,9 +85,15 @@ func NewReceiptAgent(ctx context.Context, apiKey string) (*ReceiptAgent, error) 
 
 	return &ReceiptAgent{
 		client: client,
-		// Gemini 2.5 Flash: multimodal (text+vision), generous free quota,
-		// fast enough for chat-bot latency requirements.
-		model: "gemini-2.5-flash",
+		// Gemini 3.1 Flash Lite: multimodal (text + image + PDF), 500
+		// requests/day on the free tier vs Gemini 2.5 Flash's 20.
+		// Slightly smaller model, but the receipt-scan task is a
+		// structured-extraction job (not open-ended reasoning) so the
+		// quality gap is minor and the 25× higher daily ceiling is
+		// the right trade for our bulk-upload workflow. If accuracy
+		// ever proves insufficient we can ladder back up to
+		// gemini-2.5-flash on parse failures.
+		model: "gemini-3.1-flash-lite",
 	}, nil
 }
 
@@ -139,6 +151,12 @@ func (a *ReceiptAgent) Scan(ctx context.Context, imageBytes []byte, mimeType str
 			}
 		} else {
 			lastErr = err
+			// Daily quota exhausted is a hard stop. Retrying within
+			// the same calendar day cannot possibly succeed, and each
+			// failed attempt still counts against the per-minute limit.
+			if isDailyQuotaError(err) {
+				return nil, fmt.Errorf("%w: %v", ErrQuotaExhausted, err)
+			}
 			if !isTransient(err) {
 				// Permanent error (auth, invalid input, etc.) — stop retrying.
 				return nil, fmt.Errorf("gemini generate: %w", err)
@@ -159,6 +177,34 @@ func (a *ReceiptAgent) Scan(ctx context.Context, imageBytes []byte, mimeType str
 	}
 
 	return nil, fmt.Errorf("%w: %v (after %d attempts)", ErrTransient, lastErr, maxAttempts)
+}
+
+// isDailyQuotaError detects the specific case where we've blown the
+// free-tier RPD (requests-per-day) ceiling. Gemini returns HTTP 429
+// with a body that mentions the limit name; we match on the
+// distinctive phrases so we don't waste a retry budget on a request
+// that physically cannot succeed today.
+//
+// Examples of error strings we want to catch:
+//
+//	"Error 429, ... RESOURCE_EXHAUSTED ... GenerateRequestsPerDayPerProjectPerModel"
+//	"You exceeded your current quota ... PerDay"
+//	"quota exceeded for requests per day"
+func isDailyQuotaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// Both signals must be present — generic 429s on minute-level
+	// rate limits are still worth retrying, only the daily quota is
+	// fatal until the next UTC midnight reset.
+	hasQuotaSignal := strings.Contains(msg, "resource_exhausted") ||
+		strings.Contains(msg, "exceeded your current quota") ||
+		strings.Contains(msg, "quota exceeded")
+	hasDailySignal := strings.Contains(msg, "perday") ||
+		strings.Contains(msg, "per day") ||
+		strings.Contains(msg, "daily")
+	return hasQuotaSignal && hasDailySignal
 }
 
 // isTransient returns true if the error is the kind that might succeed
