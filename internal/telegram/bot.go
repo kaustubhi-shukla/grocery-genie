@@ -97,6 +97,8 @@ func (b *Bot) registerHandlers() {
 	b.bot.Handle("/help", b.handleHelp)
 	b.bot.Handle("/stock", b.handleStockComingSoon)
 	b.bot.Handle("/cancel", b.handleCancelCommand)
+	b.bot.Handle("/lastorder", b.handleLastOrder)
+	b.bot.Handle("/recent", b.handleRecent)
 
 	// Content types
 	b.bot.Handle(tele.OnText, b.handleText)
@@ -168,6 +170,12 @@ func (b *Bot) handleHelp(c tele.Context) error {
 ✅ Confirm payment method with a tap
 ✅ Save your order to inventory
 
+*Commands:*
+/lastorder — show the most recent saved order (verify payment, items)
+/recent — show the last 5 saved orders
+/cancel — abort the in-progress order
+/help — this message
+
 *Tips:*
 • For screenshots, send as a *file/document* (not photo) for better quality
 • Multi-photo orders: send each photo, then tap *Done* when finished
@@ -182,6 +190,69 @@ func (b *Bot) handleHelp(c tele.Context) error {
 
 func (b *Bot) handleStockComingSoon(c tele.Context) error {
 	return c.Send("Stock queries arrive in Phase 2. Hang tight!")
+}
+
+// handleLastOrder shows the most recently saved order so the user
+// can verify what made it into the database (items, payment, total).
+// Useful when the user is bulk-uploading history and wants to spot-
+// check that nothing slipped through without a payment method.
+func (b *Bot) handleLastOrder(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	last, err := b.inventory.LastOrder(ctx)
+	if err != nil {
+		log.Printf("/lastorder query: %v", err)
+		return c.Send("Couldn't query the last order right now — try again in a moment.")
+	}
+	if last == nil {
+		return c.Send("No saved orders yet. Send a receipt photo to begin!")
+	}
+	return c.Send(formatOrderSummaryFromDB(last), tele.ModeMarkdown)
+}
+
+// handleRecent shows the last 5 saved orders.
+func (b *Bot) handleRecent(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	orders, err := b.inventory.RecentOrders(ctx, 5)
+	if err != nil {
+		log.Printf("/recent query: %v", err)
+		return c.Send("Couldn't query recent orders right now — try again in a moment.")
+	}
+	if len(orders) == 0 {
+		return c.Send("No saved orders yet. Send a receipt photo to begin!")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("*Last %d order(s):*\n\n", len(orders)))
+	for i, o := range orders {
+		sb.WriteString(fmt.Sprintf("*%d.* %s · _%s_\n", i+1, o.Platform, o.PaymentMethod))
+		sb.WriteString(fmt.Sprintf("   %s · %d items · Rs %.2f\n\n",
+			o.PurchasedAt.Format("Jan 2, 15:04"), o.ItemCount, o.TotalRupees))
+	}
+	return c.Send(sb.String(), tele.ModeMarkdown)
+}
+
+// formatOrderSummaryFromDB renders a saved order for /lastorder.
+func formatOrderSummaryFromDB(o *tools.OrderSummary) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("*🧾 Last saved order — %s*\n\n", o.Platform))
+	sb.WriteString(fmt.Sprintf("📅 *Saved:* %s\n", o.PurchasedAt.Format("Jan 2 2006, 15:04 IST")))
+	sb.WriteString(fmt.Sprintf("💳 *Payment:* %s\n", o.PaymentMethod))
+	sb.WriteString(fmt.Sprintf("📦 *Items:* %d\n", o.ItemCount))
+	sb.WriteString(fmt.Sprintf("💰 *Total:* Rs %.2f\n", o.TotalRupees))
+	if len(o.SampleItems) > 0 {
+		sb.WriteString("\n*Sample items:*\n")
+		for _, name := range o.SampleItems {
+			sb.WriteString(fmt.Sprintf("  • %s\n", name))
+		}
+		if o.ItemCount > len(o.SampleItems) {
+			sb.WriteString(fmt.Sprintf("  _…and %d more_\n", o.ItemCount-len(o.SampleItems)))
+		}
+	}
+	return sb.String()
 }
 
 // handleCancelCommand — text-based escape hatch in case the buttons
@@ -404,7 +475,8 @@ func (b *Bot) showOrderSummary(c tele.Context, order *PendingOrder) error {
 func (b *Bot) handleAddMore(c tele.Context) error {
 	_ = c.Respond()
 	if b.sessions.Get(c.Sender().ID) == nil {
-		return c.Send("Your session has expired. Start with a fresh receipt photo.")
+		b.neutraliseStaleButtons(c)
+		return c.Send("That order is already finished. Send a fresh receipt to start a new one.")
 	}
 	return c.Send("📸 Sure — send the next photo/PDF whenever you're ready.")
 }
@@ -413,7 +485,10 @@ func (b *Bot) handleCancelOrder(c tele.Context) error {
 	_ = c.Respond()
 	order := b.sessions.Get(c.Sender().ID)
 	if order == nil {
-		return c.Send("No pending order to cancel.")
+		// Stale Cancel tap on a previously-saved order — silently
+		// neutralise the buttons so it doesn't happen again.
+		b.neutraliseStaleButtons(c)
+		return nil
 	}
 	b.sessions.Delete(order.UserID)
 	if c.Message() != nil {
@@ -426,7 +501,10 @@ func (b *Bot) handleDoneOrder(c tele.Context) error {
 	_ = c.Respond()
 	order := b.sessions.Get(c.Sender().ID)
 	if order == nil {
-		return c.Send("No pending order. Send a receipt photo to begin.")
+		// Stale Done tap — the order was already saved/cancelled.
+		// Neutralise the buttons so the user can't tap them again.
+		b.neutraliseStaleButtons(c)
+		return nil
 	}
 	if len(order.Items) == 0 {
 		return c.Send("No items in the order yet — please send a receipt first.")
@@ -463,6 +541,23 @@ func (b *Bot) handleDoneOrder(c tele.Context) error {
 // Payment buttons → save to DB → confirmation message
 // ----------------------------------------------------------------------
 
+// neutraliseStaleButtons edits the message containing the tapped
+// button to remove its keyboard and label it as a stale message.
+// Called when a button tap arrives for a session that no longer
+// exists (order was saved/cancelled, or session timed out).
+func (b *Bot) neutraliseStaleButtons(c tele.Context) {
+	msg := c.Message()
+	if msg == nil {
+		return
+	}
+	// Strip the inline keyboard by passing an empty ReplyMarkup, and
+	// append a note so it's obvious this message is no longer actionable.
+	newText := msg.Text + "\n\n_⏎ This order is no longer active. /lastorder to see what's been saved._"
+	if _, err := b.bot.Edit(msg, newText, tele.ModeMarkdown, &tele.ReplyMarkup{}); err != nil {
+		log.Printf("neutralise stale buttons: %v", err)
+	}
+}
+
 // makePaymentHandler returns a handler bound to a specific payment
 // method label. Using a factory avoids three near-identical methods.
 func (b *Bot) makePaymentHandler(method string) tele.HandlerFunc {
@@ -470,7 +565,9 @@ func (b *Bot) makePaymentHandler(method string) tele.HandlerFunc {
 		_ = c.Respond()
 		order := b.sessions.Get(c.Sender().ID)
 		if order == nil {
-			return c.Send("Your session expired. Start with a fresh receipt.")
+			// Stale payment tap — order was already saved or cancelled.
+			b.neutraliseStaleButtons(c)
+			return nil
 		}
 
 		// Edit the payment-buttons message to a "Saving…" status,

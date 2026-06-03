@@ -205,6 +205,93 @@ func upsertInventory(ctx context.Context, tx *sql.Tx, itemID int64, item agents.
 	return newQty, nil
 }
 
+// OrderSummary is the lightweight view of a single saved order —
+// what gets returned by /lastorder and /recent. Items are aggregated
+// per purchase batch (same platform + payment_method + minute).
+type OrderSummary struct {
+	Platform      string
+	PaymentMethod string
+	PurchasedAt   time.Time
+	ItemCount     int
+	TotalRupees   float64
+	SampleItems   []string // first few item names, for compact display
+}
+
+// LastOrder returns the most recently saved order. "Order" is
+// approximated as a batch of purchases sharing the same platform +
+// payment method, written within the same minute. Good enough for a
+// summary query — we'll add a proper orders table when we need joins.
+//
+// Returns (nil, nil) if there are no saved purchases yet.
+func (inv *Inventory) LastOrder(ctx context.Context) (*OrderSummary, error) {
+	summaries, err := inv.recentOrders(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(summaries) == 0 {
+		return nil, nil
+	}
+	return summaries[0], nil
+}
+
+// RecentOrders returns the N most recent order batches.
+func (inv *Inventory) RecentOrders(ctx context.Context, limit int) ([]*OrderSummary, error) {
+	if limit <= 0 || limit > 20 {
+		limit = 5
+	}
+	return inv.recentOrders(ctx, limit)
+}
+
+func (inv *Inventory) recentOrders(ctx context.Context, limit int) ([]*OrderSummary, error) {
+	// Group by the minute the order was saved (good enough — users
+	// don't submit two orders in the same 60-second window).
+	rows, err := inv.db.QueryContext(ctx, `
+		SELECT
+		  COALESCE(p.platform, '(unknown)') AS platform,
+		  COALESCE(p.payment_method, '(unknown)') AS payment_method,
+		  MAX(p.purchased_at) AS purchased_at,
+		  COUNT(*) AS item_count,
+		  ROUND(SUM(COALESCE(p.price,0)), 2) AS total_rs,
+		  GROUP_CONCAT(i.name, '|') AS item_names
+		FROM purchases p
+		JOIN items i ON i.id = p.item_id
+		GROUP BY
+		  platform,
+		  payment_method,
+		  strftime('%Y-%m-%d %H:%M', p.purchased_at)
+		ORDER BY purchased_at DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent orders: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*OrderSummary
+	for rows.Next() {
+		var s OrderSummary
+		var purchasedAtRaw string
+		var itemNames string
+		if err := rows.Scan(&s.Platform, &s.PaymentMethod, &purchasedAtRaw,
+			&s.ItemCount, &s.TotalRupees, &itemNames); err != nil {
+			return nil, err
+		}
+		// Best-effort parse — Go's time.String() format is what's in
+		// the DB. We just keep the prefix that's parseable.
+		if t, err := time.Parse("2006-01-02 15:04:05", purchasedAtRaw[:19]); err == nil {
+			s.PurchasedAt = t
+		}
+		// Take up to first 6 item names for the preview
+		items := strings.Split(itemNames, "|")
+		if len(items) > 6 {
+			items = items[:6]
+		}
+		s.SampleItems = items
+		results = append(results, &s)
+	}
+	return results, rows.Err()
+}
+
 // nullable returns a *float64 that's nil when the value is 0 — used
 // for INSERTing NULL into the DB instead of literal zero, which keeps
 // "we don't know the price" distinct from "the price is zero rupees."

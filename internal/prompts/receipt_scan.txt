@@ -48,6 +48,16 @@ CRITICAL RULES:
 
 6. Store name:
    - Recognize common Indian retailers: FirstClub, Zepto, Blinkit, Swiggy Instamart, BigBasket, Reliance Smart, DMart, More, Amazon Fresh, Flipkart Minutes
+   - PREFER the consumer-facing brand name over the legal entity name. Examples:
+     * "TROLLEYPOP RETAIL PRIVATE LIMITED" → "FirstClub"
+     * "Kiranakart Technologies Private Limited" → "Zepto"
+     * "Grofers India Private Limited" → "Blinkit"
+     * "Bundl Technologies Private Limited" → "Swiggy Instamart"
+     * "Innovative Retail Concepts" → "BigBasket"
+     If you see a legal entity name on the invoice (often in fine print
+     near GSTIN or company address), translate it to the brand the user
+     knows. Look elsewhere on the receipt for a logo, app name, or URL
+     that confirms the brand.
    - If unrecognizable, set to null (the user will be asked to confirm)
 
 7. Skip non-item lines: GST, CGST, SGST, discounts, delivery fees, tips. Only product line items.
