@@ -132,6 +132,20 @@ func (a *ReceiptAgent) Scan(ctx context.Context, imageBytes []byte, mimeType str
 		},
 		ResponseMIMEType: "application/json",
 		Temperature:      genai.Ptr[float32](0.1), // low temp = consistent, deterministic output
+
+		// Gemini 2.5 Flash defaults to "dynamic thinking" — it silently
+		// spends variable time on internal chain-of-thought before
+		// generating output. Great for open-ended reasoning tasks,
+		// wasteful for structured extraction from a receipt image (the
+		// job is "read pixels, emit JSON in the given schema"). Setting
+		// ThinkingBudget=0 disables the thinking phase entirely,
+		// cutting per-scan latency from ~22s to typically 5-8s. If
+		// accuracy on complex receipts ever regresses we can raise
+		// this to a small positive budget without going back to the
+		// dynamic default.
+		ThinkingConfig: &genai.ThinkingConfig{
+			ThinkingBudget: genai.Ptr[int32](0),
+		},
 	}
 
 	// Retry loop with exponential backoff for transient errors.
