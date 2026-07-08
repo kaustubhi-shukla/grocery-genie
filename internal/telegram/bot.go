@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -708,7 +709,7 @@ func (b *Bot) askNextAmbiguous(c tele.Context, order *PendingOrder) error {
 	markup.Inline(markup.Row(b.btnSkipAmbig), markup.Row(b.btnCancel))
 
 	return c.Send(fmt.Sprintf(
-		"⚠️ I couldn't read *%s* clearly. What was it? Reply with the correct quantity/name, or tap Skip.",
+		"⚠️ I couldn't read *%s* clearly.\n\nReply with just a quantity + unit — e.g. `4 pieces`, `250g`, `2 dozen`, `1 pack`, `1 bunch`, `1.5 kg`.\nItem name in front is fine too (`Ginger 250g` works).\n\nOr tap Skip.",
 		next,
 	), markup, tele.ModeMarkdown)
 }
@@ -785,47 +786,60 @@ func (b *Bot) applyAmbiguousAnswer(c tele.Context, order *PendingOrder, answer s
 	return b.advanceFlow(c)
 }
 
+// quantityRegex finds the first "number + optional unit word" pair
+// in a reply. Works whether the reply starts with the item name
+// ("Ginger= 250 gms"), a separator ("- 4 pieces"), a bare number
+// ("4"), or the number stuck to the unit ("250gms"). The unit
+// capture is greedy on letters only, so punctuation like "=" or "-"
+// before the number is ignored automatically.
+var quantityRegex = regexp.MustCompile(`(\d+(?:\.\d+)?)\s*([a-z]*)`)
+
 // parseQuantityReply pulls a quantity + optional unit out of short
 // replies people actually type. Returns parsed=false on anything
 // it can't confidently structure (sentences, free text).
 //
-// Accepted forms (case-insensitive, whitespace flexible):
+// Accepted forms (case-insensitive, whitespace flexible, item name
+// prefix optional):
 //
-//	"4"             -> 4, "pieces"
-//	"4 pieces"      -> 4, "pieces"
-//	"4 pcs"         -> 4, "pieces"
-//	"2 dozen"       -> 24, "pieces"
-//	"250g" / "250 gms" / "250 grams" -> 250, "g"
-//	"1.5 kg"        -> 1.5, "kg"
-//	"500 ml"        -> 500, "ml"
-//	"1 litre"       -> 1, "litres"
-//	"half a bottle" -> not parsed (free text, returns false)
+//	"4"                                 -> 4, "pieces"
+//	"4 pieces" / "4 pcs" / "4 nos"      -> 4, "pieces"
+//	"2 dozen"                           -> 24, "pieces"
+//	"250g" / "250 gms" / "250 grams"    -> 250, "g"
+//	"1.5 kg"                            -> 1.5, "kg"
+//	"500 ml"                            -> 500, "ml"
+//	"1 litre" / "1 l"                   -> 1, "litres"
+//	"1 pack" / "3 packets"              -> 1, "packets"
+//	"1 bunch"                           -> 1, "bunch"
+//	"Ginger= 250 gms"                   -> 250, "g"    (name prefix stripped)
+//	"Green chilli- 1 pack"              -> 1, "packets"
+//	"half a bottle"                     -> not parsed (no number)
 func parseQuantityReply(s string) (qty float64, unit string, ok bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
-	// Strip common filler so "set to 4 pieces" still parses.
-	for _, p := range []string{"set to ", "make it ", "it's ", "its ", "actually ", "qty ", "quantity "} {
-		lower = strings.TrimPrefix(lower, p)
-	}
-
-	// Walk the first token: must start with a number.
-	var numStr string
-	for _, r := range lower {
-		if (r >= '0' && r <= '9') || r == '.' {
-			numStr += string(r)
-			continue
-		}
-		break
-	}
-	if numStr == "" {
+	if lower == "" {
 		return 0, "", false
 	}
+
+	// Regex finds the FIRST number anywhere in the string (skipping
+	// any leading item name / punctuation) plus the letter-word
+	// right after it. Trailing "s" tolerated because unit switch
+	// below matches on prefixes.
+	m := quantityRegex.FindStringSubmatch(lower)
+	if len(m) < 2 {
+		return 0, "", false
+	}
+	numStr := m[1]
+	rest := ""
+	if len(m) >= 3 {
+		rest = m[2]
+	}
+
 	n, err := strconv.ParseFloat(numStr, 64)
 	if err != nil || n <= 0 {
 		return 0, "", false
 	}
 
-	// Whatever's after the number tells us the unit.
-	rest := strings.TrimSpace(strings.TrimPrefix(lower, numStr))
+	// Normalise the unit word into one of the canonical units used
+	// elsewhere in the app.
 	switch {
 	case rest == "" || rest == "pcs" || rest == "pc" || rest == "piece" || rest == "pieces" || rest == "nos" || rest == "no":
 		return n, "pieces", true
