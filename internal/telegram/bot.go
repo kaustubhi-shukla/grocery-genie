@@ -736,10 +736,9 @@ func (b *Bot) applyAmbiguousAnswer(c tele.Context, order *PendingOrder, answer s
 	qty, unit, parsed := parseQuantityReply(answer)
 
 	if parsed {
-		// Try to update the matching item already on the order. We
-		// match by case-insensitive substring on either side so that
-		// "robusta banana" matches the user saying "bananas" and
-		// vice versa.
+		// Try to update the matching item already on the order. Loose
+		// substring match in either direction so plural/singular and
+		// modifier words ("robusta banana" vs "banana") still align.
 		updated := false
 		b.sessions.Update(order.UserID, func(o *PendingOrder) {
 			for i := range o.Items {
@@ -757,18 +756,42 @@ func (b *Bot) applyAmbiguousAnswer(c tele.Context, order *PendingOrder, answer s
 		})
 
 		if updated {
+			log.Printf("ambiguous-reply MATCHED-UPDATE: item=%q qty=%g unit=%s", ambigName, qty, unit)
 			msg := fmt.Sprintf("✓ Got it: %s set to *%g %s*.", ambigName, qty, unit)
 			if err := c.Send(msg, tele.ModeMarkdown); err != nil {
 				return err
 			}
 			return b.advanceFlow(c)
 		}
+
+		// Parse succeeded but no existing item's name matched. Fall
+		// back to inserting a NEW item using the ambigName (Gemini's
+		// label for the ambiguous row) as the name. This preserves
+		// the user's intent instead of silently dropping the reply.
+		// Only fires when parsed=true, so we can't get sentence-junk
+		// as an item name.
+		b.sessions.Update(order.UserID, func(o *PendingOrder) {
+			o.Items = append(o.Items, agents.ReceiptItem{
+				Name:         strings.ToLower(ambigName),
+				Quantity:     qty,
+				Unit:         unit,
+				Category:     "other",
+				TrackingType: "countable",
+			})
+			o.CurrentAmbiguous = ""
+			o.Stage = stageCollectingPhotos
+		})
+		log.Printf("ambiguous-reply PARSED-NOMATCH-INSERTED: item=%q qty=%g unit=%s", ambigName, qty, unit)
+		msg := fmt.Sprintf("✓ Added *%s* — %g %s. _(No matching item in the scan; recorded as a fresh row.)_", ambigName, qty, unit)
+		if err := c.Send(msg, tele.ModeMarkdown); err != nil {
+			return err
+		}
+		return b.advanceFlow(c)
 	}
 
-	// Couldn't confidently parse the reply into a structured update —
-	// log it for future eval data and acknowledge without creating
-	// junk items. The user can /cancel and re-upload if needed.
-	log.Printf("ambiguous-reply unparsed: item=%q reply=%q", ambigName, answer)
+	// Genuine parse failure — no number in the reply at all. Skip
+	// this ambiguous item and let the user know.
+	log.Printf("ambiguous-reply PARSE-FAILED: item=%q reply=%q", ambigName, answer)
 
 	b.sessions.Update(order.UserID, func(o *PendingOrder) {
 		o.CurrentAmbiguous = ""
@@ -776,8 +799,8 @@ func (b *Bot) applyAmbiguousAnswer(c tele.Context, order *PendingOrder, answer s
 	})
 
 	hint := fmt.Sprintf(
-		"Noted, but I couldn't structure your reply yet. For now I'll skip *%s*.\n"+
-			"_(Tip: try short replies like \"4\", \"4 pieces\", \"2 dozen\", or \"250g\". Full natural-language clarification arrives in Phase 2.)_",
+		"Noted, but I couldn't find a quantity in your reply. Skipping *%s*.\n"+
+			"_(Tip: include a number — \"4\", \"4 pieces\", \"250g\", \"1 pack\".)_",
 		ambigName,
 	)
 	if err := c.Send(hint, tele.ModeMarkdown); err != nil {
@@ -858,9 +881,12 @@ func parseQuantityReply(s string) (qty float64, unit string, ok bool) {
 	case strings.HasPrefix(rest, "bunch"):
 		return n, "bunch", true
 	}
-	// Number followed by free text we don't recognise — bail out so
-	// we don't guess wrong.
-	return 0, "", false
+	// The trailing word wasn't a known unit — it's almost certainly
+	// part of the item name ("3 capsicum", "5 tender coconut"). We
+	// still have a valid number, so treat it as a piece count. Only
+	// the "no number at all" case (e.g. "half a bottle") should
+	// return unparsed.
+	return n, "pieces", true
 }
 
 // itemMatches returns true if the item already on the order seems
